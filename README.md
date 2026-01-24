@@ -145,10 +145,11 @@ This is an unofficial community SDK aiming for parity with [logfire-rust](https:
 - [x] Metrics (counter, gauge)
 - [x] OTLP HTTP/JSON export
 - [x] Environment-based configuration
-- [ ] Histograms export (instruments implemented, export WIP)
-- [ ] Protobuf encoding
-- [ ] Trace context propagation
-- [ ] Batched async export
+- [x] Batched async export (background flush thread)
+- [x] Parent-child span linking (thread-local)
+- [ ] Histograms (types implemented, no convenience API yet)
+- [ ] Protobuf encoding (JSON only)
+- [ ] W3C trace context propagation (cross-service)
 
 ## License
 

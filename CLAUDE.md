@@ -92,8 +92,8 @@ const token = std.posix.getenv("LOGFIRE_WRITE_TOKEN") orelse
 ## testing
 
 ```bash
-zig build test              # run tests
-zig build run-example       # run examples/basic.zig
+zig build test     # run tests
+zig build example  # run examples/basic.zig
 ```
 
 test with real export requires LOGFIRE_WRITE_TOKEN in .env
