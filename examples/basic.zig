@@ -1,6 +1,6 @@
 //! basic logfire example
 //!
-//! demonstrates spans, logging, and export to logfire.
+//! demonstrates spans, logging, metrics, and export to logfire.
 //!
 //! run with:
 //!   LOGFIRE_TOKEN=your_token zig build example
@@ -52,6 +52,12 @@ pub fn main() !void {
             std.posix.nanosleep(0, 5 * std.time.ns_per_ms);
         }
     }
+
+    // metrics
+    logfire.counter("requests.total", 1);
+    logfire.counter("requests.total", 1);
+    logfire.gaugeInt("connections.active", 42);
+    logfire.gaugeDouble("cpu.usage", 0.75);
 
     // flush to ensure all data is sent
     try lf.flush();

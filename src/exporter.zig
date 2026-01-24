@@ -1,18 +1,23 @@
 //! OTLP HTTP/JSON exporter
 //!
-//! sends spans and logs to logfire (or any OTLP-compatible backend)
+//! sends spans, logs, and metrics to logfire (or any OTLP-compatible backend)
 //! uses HTTP with JSON encoding for simplicity.
 //!
 //! endpoints:
 //! - /v1/traces - span data
 //! - /v1/logs - log records
+//! - /v1/metrics - metric data
 //!
 //! see: https://opentelemetry.io/docs/specs/otlp/
 
 const std = @import("std");
+const json = std.json;
 const Config = @import("config.zig").Config;
 const Span = @import("span.zig").Span;
 const LogRecord = @import("log.zig").LogRecord;
+const Attribute = @import("attribute.zig").Attribute;
+const metrics_mod = @import("metrics.zig");
+const MetricData = metrics_mod.MetricData;
 
 pub const Exporter = struct {
     allocator: std.mem.Allocator,
@@ -37,51 +42,57 @@ pub const Exporter = struct {
         spans: []const Span.Data,
         logs: []const LogRecord,
     ) !void {
+        try self.sendAll(spans, logs, &.{});
+    }
+
+    /// send spans, logs, and metrics to OTLP endpoints
+    pub fn sendAll(
+        self: *Exporter,
+        spans: []const Span.Data,
+        logs: []const LogRecord,
+        metrics: []const MetricData,
+    ) !void {
         if (!self.config.shouldSend()) {
-            // just log to console if not sending
-            self.printToConsole(spans, logs);
+            self.printToConsole(spans, logs, metrics);
             return;
         }
 
         const base_url = self.config.base_url orelse return error.NoBaseUrl;
 
-        // send spans
         if (spans.len > 0) {
             const traces_json = try self.buildTracesJson(spans);
             defer self.allocator.free(traces_json);
-
             try self.sendToEndpoint(base_url, "/v1/traces", traces_json);
         }
 
-        // send logs
         if (logs.len > 0) {
             const logs_json = try self.buildLogsJson(logs);
             defer self.allocator.free(logs_json);
-
             try self.sendToEndpoint(base_url, "/v1/logs", logs_json);
+        }
+
+        if (metrics.len > 0) {
+            const metrics_json = try self.buildMetricsJson(metrics);
+            defer self.allocator.free(metrics_json);
+            try self.sendToEndpoint(base_url, "/v1/metrics", metrics_json);
         }
     }
 
     fn sendToEndpoint(self: *Exporter, base_url: []const u8, path: []const u8, body: []const u8) !void {
-        // build full URL
         var url_buf: [1024]u8 = undefined;
         const url = std.fmt.bufPrint(&url_buf, "{s}{s}", .{ base_url, path }) catch return error.UrlTooLong;
 
-        // response writer
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
 
-        // build auth header on stack
         var auth_buf: [2048]u8 = undefined;
         var auth_header: ?[]const u8 = null;
         if (self.config.token) |token| {
             auth_header = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{token}) catch null;
         }
 
-        // headers
         var headers: std.http.Client.Request.Headers = .{
             .content_type = .{ .override = "application/json" },
-            // disable gzip: zig stdlib flate.Decompress can panic
             .accept_encoding = .{ .override = "identity" },
             .user_agent = .{ .override = "logfire-zig/0.1.0" },
         };
@@ -103,143 +114,225 @@ pub const Exporter = struct {
         }
     }
 
-    /// build OTLP JSON for traces
-    /// see: https://opentelemetry.io/docs/specs/otlp/#otlphttp-request
     fn buildTracesJson(self: *Exporter, spans: []const Span.Data) ![]u8 {
-        var json: std.ArrayList(u8) = .{};
-        errdefer json.deinit(self.allocator);
+        var output: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer output.deinit();
+        var jw: json.Stringify = .{ .writer = &output.writer };
 
-        var w = json.writer(self.allocator);
+        try jw.beginObject();
+        try jw.objectField("resourceSpans");
+        try jw.beginArray();
+        try jw.beginObject();
 
-        try w.writeAll("{\"resourceSpans\":[{");
+        // resource
+        try jw.objectField("resource");
+        try jw.beginObject();
+        try jw.objectField("attributes");
+        try self.writeResourceAttributesArray(&jw);
+        try jw.endObject();
 
-        // resource attributes
-        try w.writeAll("\"resource\":{\"attributes\":[");
-        try self.writeResourceAttributes(&w);
-        try w.writeAll("]},");
+        // scopeSpans
+        try jw.objectField("scopeSpans");
+        try jw.beginArray();
+        try jw.beginObject();
+        try jw.objectField("scope");
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write("logfire-zig");
+        try jw.endObject();
 
-        // scope spans
-        try w.writeAll("\"scopeSpans\":[{");
-        try w.writeAll("\"scope\":{\"name\":\"logfire-zig\"},");
-        try w.writeAll("\"spans\":[");
-
-        for (spans, 0..) |s, i| {
-            if (i > 0) try w.writeByte(',');
-            try self.writeSpanJson(&w, s);
+        try jw.objectField("spans");
+        try jw.beginArray();
+        for (spans) |s| {
+            try self.writeSpanObject(&jw, s);
         }
+        try jw.endArray();
 
-        try w.writeAll("]}]}]}");
+        try jw.endObject();
+        try jw.endArray();
 
-        return json.toOwnedSlice(self.allocator);
+        try jw.endObject();
+        try jw.endArray();
+        try jw.endObject();
+
+        return output.toOwnedSlice();
     }
 
-    /// build OTLP JSON for logs
     fn buildLogsJson(self: *Exporter, logs: []const LogRecord) ![]u8 {
-        var json: std.ArrayList(u8) = .{};
-        errdefer json.deinit(self.allocator);
+        var output: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer output.deinit();
+        var jw: json.Stringify = .{ .writer = &output.writer };
 
-        var w = json.writer(self.allocator);
+        try jw.beginObject();
+        try jw.objectField("resourceLogs");
+        try jw.beginArray();
+        try jw.beginObject();
 
-        try w.writeAll("{\"resourceLogs\":[{");
+        // resource
+        try jw.objectField("resource");
+        try jw.beginObject();
+        try jw.objectField("attributes");
+        try self.writeResourceAttributesArray(&jw);
+        try jw.endObject();
 
-        // resource attributes
-        try w.writeAll("\"resource\":{\"attributes\":[");
-        try self.writeResourceAttributes(&w);
-        try w.writeAll("]},");
+        // scopeLogs
+        try jw.objectField("scopeLogs");
+        try jw.beginArray();
+        try jw.beginObject();
+        try jw.objectField("scope");
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write("logfire-zig");
+        try jw.endObject();
 
-        // scope logs
-        try w.writeAll("\"scopeLogs\":[{");
-        try w.writeAll("\"scope\":{\"name\":\"logfire-zig\"},");
-        try w.writeAll("\"logRecords\":[");
-
-        for (logs, 0..) |log, i| {
-            if (i > 0) try w.writeByte(',');
-            try self.writeLogJson(&w, log);
+        try jw.objectField("logRecords");
+        try jw.beginArray();
+        for (logs) |log| {
+            try self.writeLogObject(&jw, log);
         }
+        try jw.endArray();
 
-        try w.writeAll("]}]}]}");
+        try jw.endObject();
+        try jw.endArray();
 
-        return json.toOwnedSlice(self.allocator);
+        try jw.endObject();
+        try jw.endArray();
+        try jw.endObject();
+
+        return output.toOwnedSlice();
     }
 
-    fn writeResourceAttributes(self: *Exporter, w: anytype) !void {
-        var first = true;
+    fn buildMetricsJson(self: *Exporter, metrics: []const MetricData) ![]u8 {
+        var output: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer output.deinit();
+        var jw: json.Stringify = .{ .writer = &output.writer };
 
+        try jw.beginObject();
+        try jw.objectField("resourceMetrics");
+        try jw.beginArray();
+        try jw.beginObject();
+
+        // resource
+        try jw.objectField("resource");
+        try jw.beginObject();
+        try jw.objectField("attributes");
+        try self.writeResourceAttributesArray(&jw);
+        try jw.endObject();
+
+        // scopeMetrics
+        try jw.objectField("scopeMetrics");
+        try jw.beginArray();
+        try jw.beginObject();
+        try jw.objectField("scope");
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write("logfire-zig");
+        try jw.endObject();
+
+        try jw.objectField("metrics");
+        try jw.beginArray();
+        for (metrics) |metric| {
+            try writeMetricObject(&jw, metric);
+        }
+        try jw.endArray();
+
+        try jw.endObject();
+        try jw.endArray();
+
+        try jw.endObject();
+        try jw.endArray();
+        try jw.endObject();
+
+        return output.toOwnedSlice();
+    }
+
+    fn writeResourceAttributesArray(self: *Exporter, jw: *json.Stringify) !void {
+        try jw.beginArray();
         if (self.config.service_name) |name| {
-            try writeAttribute(w, "service.name", .{ .string = name }, &first);
+            try writeAttributeObject(jw, "service.name", .{ .string = name });
         }
         if (self.config.service_version) |version| {
-            try writeAttribute(w, "service.version", .{ .string = version }, &first);
+            try writeAttributeObject(jw, "service.version", .{ .string = version });
         }
         if (self.config.environment) |env| {
-            try writeAttribute(w, "deployment.environment.name", .{ .string = env }, &first);
+            try writeAttributeObject(jw, "deployment.environment.name", .{ .string = env });
         }
+        try jw.endArray();
     }
 
-    fn writeSpanJson(self: *Exporter, w: anytype, s: Span.Data) !void {
+    fn writeSpanObject(self: *Exporter, jw: *json.Stringify, s: Span.Data) !void {
         _ = self;
-        try w.writeByte('{');
+        try jw.beginObject();
 
-        // trace and span IDs (hex encoded)
-        try w.writeAll("\"traceId\":\"");
-        try writeHex(w, &s.trace_id);
-        try w.writeAll("\",\"spanId\":\"");
-        try writeHex(w, &s.span_id);
-        try w.writeAll("\",");
+        try jw.objectField("traceId");
+        try writeHexString(jw, &s.trace_id);
 
-        // name
-        try w.writeAll("\"name\":");
-        try writeJsonString(w, s.name);
-        try w.writeByte(',');
+        try jw.objectField("spanId");
+        try writeHexString(jw, &s.span_id);
 
-        // kind (internal = 1)
-        try w.writeAll("\"kind\":1,");
+        try jw.objectField("name");
+        try jw.write(s.name);
 
-        // timestamps (nanoseconds)
-        try w.print("\"startTimeUnixNano\":\"{d}\",", .{s.start_time_ns});
-        try w.print("\"endTimeUnixNano\":\"{d}\",", .{s.end_time_ns});
+        try jw.objectField("kind");
+        try jw.write(@as(i64, 1));
 
-        // attributes (empty for now, will add later)
-        try w.writeAll("\"attributes\":[]");
+        try jw.objectField("startTimeUnixNano");
+        try writeNsString(jw, s.start_time_ns);
 
-        // status (unset = 0)
-        try w.writeAll(",\"status\":{\"code\":0}");
+        try jw.objectField("endTimeUnixNano");
+        try writeNsString(jw, s.end_time_ns);
 
-        try w.writeByte('}');
+        try jw.objectField("attributes");
+        try jw.beginArray();
+        for (s.attributes[0..s.attribute_count]) |attr| {
+            try writeAttributeFromAttr(jw, attr);
+        }
+        try jw.endArray();
+
+        try jw.objectField("status");
+        try jw.beginObject();
+        try jw.objectField("code");
+        try jw.write(@as(i64, 0));
+        try jw.endObject();
+
+        try jw.endObject();
     }
 
-    fn writeLogJson(self: *Exporter, w: anytype, log: LogRecord) !void {
+    fn writeLogObject(self: *Exporter, jw: *json.Stringify, log: LogRecord) !void {
         _ = self;
-        try w.writeByte('{');
+        try jw.beginObject();
 
-        // timestamp
-        try w.print("\"timeUnixNano\":\"{d}\",", .{log.timestamp_ns});
+        try jw.objectField("timeUnixNano");
+        try writeNsString(jw, log.timestamp_ns);
 
-        // severity
-        try w.print("\"severityNumber\":{d},", .{log.level.severity()});
-        try w.writeAll("\"severityText\":");
-        try writeJsonString(w, log.level.name());
-        try w.writeByte(',');
+        try jw.objectField("severityNumber");
+        try jw.write(@as(i64, log.level.severity()));
 
-        // body
-        try w.writeAll("\"body\":{\"stringValue\":");
-        try writeJsonString(w, log.message);
-        try w.writeAll("},");
+        try jw.objectField("severityText");
+        try jw.write(log.level.name());
 
-        // trace context
+        try jw.objectField("body");
+        try jw.beginObject();
+        try jw.objectField("stringValue");
+        try jw.write(log.message);
+        try jw.endObject();
+
         if (log.trace_id) |tid| {
-            try w.writeAll("\"traceId\":\"");
-            try writeHex(w, &tid);
-            try w.writeAll("\",");
+            try jw.objectField("traceId");
+            try writeHexString(jw, &tid);
         }
 
-        // attributes (empty for now)
-        try w.writeAll("\"attributes\":[]");
+        try jw.objectField("attributes");
+        try jw.beginArray();
+        for (log.attributes[0..log.attribute_count]) |attr| {
+            try writeAttributeFromAttr(jw, attr);
+        }
+        try jw.endArray();
 
-        try w.writeByte('}');
+        try jw.endObject();
     }
 
-    fn printToConsole(self: *Exporter, spans: []const Span.Data, logs: []const LogRecord) void {
+    fn printToConsole(self: *Exporter, spans: []const Span.Data, logs: []const LogRecord, metrics: []const MetricData) void {
         const console = self.config.console orelse return;
         if (!console.enabled) return;
 
@@ -252,8 +345,218 @@ pub const Exporter = struct {
             if (@intFromEnum(log.level) < @intFromEnum(console.min_level)) continue;
             std.debug.print("[{s}] {s}\n", .{ log.level.name(), log.message });
         }
+
+        for (metrics) |metric| {
+            std.debug.print("[metric] {s}\n", .{metric.name});
+        }
     }
 };
+
+// helper functions
+
+fn writeMetricObject(jw: *json.Stringify, metric: MetricData) !void {
+    try jw.beginObject();
+
+    try jw.objectField("name");
+    try jw.write(metric.name);
+
+    if (metric.description.len > 0) {
+        try jw.objectField("description");
+        try jw.write(metric.description);
+    }
+
+    if (metric.unit.len > 0) {
+        try jw.objectField("unit");
+        try jw.write(metric.unit);
+    }
+
+    switch (metric.data) {
+        .sum => |sum| {
+            try jw.objectField("sum");
+            try jw.beginObject();
+            try jw.objectField("aggregationTemporality");
+            try jw.write(@as(i64, @intFromEnum(sum.temporality)));
+            try jw.objectField("isMonotonic");
+            try jw.write(sum.is_monotonic);
+            try jw.objectField("dataPoints");
+            try jw.beginArray();
+            for (sum.data_points) |dp| {
+                try writeNumberDataPointObject(jw, dp);
+            }
+            try jw.endArray();
+            try jw.endObject();
+        },
+        .gauge => |gauge| {
+            try jw.objectField("gauge");
+            try jw.beginObject();
+            try jw.objectField("dataPoints");
+            try jw.beginArray();
+            for (gauge.data_points) |dp| {
+                try writeNumberDataPointObject(jw, dp);
+            }
+            try jw.endArray();
+            try jw.endObject();
+        },
+        .histogram => |hist| {
+            try jw.objectField("histogram");
+            try jw.beginObject();
+            try jw.objectField("aggregationTemporality");
+            try jw.write(@as(i64, @intFromEnum(hist.temporality)));
+            try jw.objectField("dataPoints");
+            try jw.beginArray();
+            for (hist.data_points) |dp| {
+                try writeHistogramDataPointObject(jw, dp);
+            }
+            try jw.endArray();
+            try jw.endObject();
+        },
+        .exponential_histogram => |exp_hist| {
+            try jw.objectField("exponentialHistogram");
+            try jw.beginObject();
+            try jw.objectField("aggregationTemporality");
+            try jw.write(@as(i64, @intFromEnum(exp_hist.temporality)));
+            try jw.objectField("dataPoints");
+            try jw.beginArray();
+            for (exp_hist.data_points) |dp| {
+                try writeExponentialHistogramDataPointObject(jw, dp);
+            }
+            try jw.endArray();
+            try jw.endObject();
+        },
+    }
+
+    try jw.endObject();
+}
+
+fn writeNumberDataPointObject(jw: *json.Stringify, dp: metrics_mod.NumberDataPoint) !void {
+    try jw.beginObject();
+
+    try jw.objectField("startTimeUnixNano");
+    try writeNsString(jw, dp.start_time_ns);
+
+    try jw.objectField("timeUnixNano");
+    try writeNsString(jw, dp.time_ns);
+
+    switch (dp.value) {
+        .int => |v| {
+            try jw.objectField("asInt");
+            try writeIntString(jw, v);
+        },
+        .double => |v| {
+            try jw.objectField("asDouble");
+            try jw.write(v);
+        },
+    }
+
+    if (dp.attributes.len > 0) {
+        try jw.objectField("attributes");
+        try jw.beginArray();
+        for (dp.attributes) |attr| {
+            try writeAttributeFromAttr(jw, attr);
+        }
+        try jw.endArray();
+    }
+
+    try jw.endObject();
+}
+
+fn writeHistogramDataPointObject(jw: *json.Stringify, dp: metrics_mod.HistogramDataPoint) !void {
+    try jw.beginObject();
+
+    try jw.objectField("startTimeUnixNano");
+    try writeNsString(jw, dp.start_time_ns);
+
+    try jw.objectField("timeUnixNano");
+    try writeNsString(jw, dp.time_ns);
+
+    try jw.objectField("count");
+    try writeIntString(jw, @intCast(dp.count));
+
+    try jw.objectField("sum");
+    try jw.write(dp.sum);
+
+    try jw.objectField("bucketCounts");
+    try jw.beginArray();
+    for (dp.bucket_counts) |c| {
+        try writeIntString(jw, @intCast(c));
+    }
+    try jw.endArray();
+
+    try jw.objectField("explicitBounds");
+    try jw.beginArray();
+    for (dp.explicit_bounds) |b| {
+        try jw.write(b);
+    }
+    try jw.endArray();
+
+    try jw.objectField("min");
+    try jw.write(dp.min);
+
+    try jw.objectField("max");
+    try jw.write(dp.max);
+
+    if (dp.attributes.len > 0) {
+        try jw.objectField("attributes");
+        try jw.beginArray();
+        for (dp.attributes) |attr| {
+            try writeAttributeFromAttr(jw, attr);
+        }
+        try jw.endArray();
+    }
+
+    try jw.endObject();
+}
+
+fn writeExponentialHistogramDataPointObject(jw: *json.Stringify, dp: metrics_mod.ExponentialHistogramDataPoint) !void {
+    try jw.beginObject();
+
+    try jw.objectField("startTimeUnixNano");
+    try writeNsString(jw, dp.start_time_ns);
+
+    try jw.objectField("timeUnixNano");
+    try writeNsString(jw, dp.time_ns);
+
+    try jw.objectField("count");
+    try writeIntString(jw, @intCast(dp.count));
+
+    try jw.objectField("sum");
+    try jw.write(dp.sum);
+
+    try jw.objectField("scale");
+    try jw.write(@as(i64, dp.scale));
+
+    try jw.objectField("zeroCount");
+    try writeIntString(jw, @intCast(dp.zero_count));
+
+    try jw.objectField("positive");
+    try jw.beginObject();
+    try jw.objectField("offset");
+    try jw.write(@as(i64, dp.positive_offset));
+    try jw.objectField("bucketCounts");
+    try jw.beginArray();
+    for (dp.positive_bucket_counts) |c| {
+        try writeIntString(jw, @intCast(c));
+    }
+    try jw.endArray();
+    try jw.endObject();
+
+    try jw.objectField("min");
+    try jw.write(dp.min);
+
+    try jw.objectField("max");
+    try jw.write(dp.max);
+
+    if (dp.attributes.len > 0) {
+        try jw.objectField("attributes");
+        try jw.beginArray();
+        for (dp.attributes) |attr| {
+            try writeAttributeFromAttr(jw, attr);
+        }
+        try jw.endArray();
+    }
+
+    try jw.endObject();
+}
 
 const AttributeValue = union(enum) {
     string: []const u8,
@@ -262,56 +565,82 @@ const AttributeValue = union(enum) {
     bool_val: bool,
 };
 
-fn writeAttribute(w: anytype, key: []const u8, value: AttributeValue, first: *bool) !void {
-    if (!first.*) try w.writeByte(',');
-    first.* = false;
-    try writeAttributeKv(w, key, value);
-}
-
-fn writeAttributeKv(w: anytype, key: []const u8, value: AttributeValue) !void {
-    try w.writeAll("{\"key\":");
-    try writeJsonString(w, key);
-    try w.writeAll(",\"value\":{");
-
+fn writeAttributeObject(jw: *json.Stringify, key: []const u8, value: AttributeValue) !void {
+    try jw.beginObject();
+    try jw.objectField("key");
+    try jw.write(key);
+    try jw.objectField("value");
+    try jw.beginObject();
     switch (value) {
         .string => |s| {
-            try w.writeAll("\"stringValue\":");
-            try writeJsonString(w, s);
+            try jw.objectField("stringValue");
+            try jw.write(s);
         },
         .int => |i| {
-            try w.print("\"intValue\":\"{d}\"", .{i});
+            try jw.objectField("intValue");
+            try writeIntString(jw, i);
         },
         .float => |f| {
-            try w.print("\"doubleValue\":{d}", .{f});
+            try jw.objectField("doubleValue");
+            try jw.write(f);
         },
         .bool_val => |b| {
-            try w.print("\"boolValue\":{}", .{b});
+            try jw.objectField("boolValue");
+            try jw.write(b);
         },
     }
-
-    try w.writeAll("}}");
+    try jw.endObject();
+    try jw.endObject();
 }
 
-fn writeHex(w: anytype, bytes: []const u8) !void {
+fn writeAttributeFromAttr(jw: *json.Stringify, attr: Attribute) !void {
+    try jw.beginObject();
+    try jw.objectField("key");
+    try jw.write(attr.key);
+    try jw.objectField("value");
+    try jw.beginObject();
+    switch (attr.value) {
+        .string => |s| {
+            try jw.objectField("stringValue");
+            try jw.write(s);
+        },
+        .int => |i| {
+            try jw.objectField("intValue");
+            try writeIntString(jw, i);
+        },
+        .float => |f| {
+            try jw.objectField("doubleValue");
+            try jw.write(f);
+        },
+        .bool_val => |b| {
+            try jw.objectField("boolValue");
+            try jw.write(b);
+        },
+    }
+    try jw.endObject();
+    try jw.endObject();
+}
+
+fn writeHexString(jw: *json.Stringify, bytes: []const u8) !void {
+    var buf: [64]u8 = undefined;
+    var i: usize = 0;
     for (bytes) |b| {
-        try w.print("{x:0>2}", .{b});
+        _ = std.fmt.bufPrint(buf[i .. i + 2], "{x:0>2}", .{b}) catch unreachable;
+        i += 2;
     }
+    try jw.write(buf[0..i]);
 }
 
-fn writeJsonString(w: anytype, s: []const u8) !void {
-    try w.writeByte('"');
-    for (s) |c| {
-        switch (c) {
-            '"' => try w.writeAll("\\\""),
-            '\\' => try w.writeAll("\\\\"),
-            '\n' => try w.writeAll("\\n"),
-            '\r' => try w.writeAll("\\r"),
-            '\t' => try w.writeAll("\\t"),
-            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f => try w.print("\\u00{x:0>2}", .{c}),
-            else => try w.writeByte(c),
-        }
-    }
-    try w.writeByte('"');
+fn writeNsString(jw: *json.Stringify, ns: i128) !void {
+    var buf: [32]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{d}", .{ns}) catch unreachable;
+    try jw.write(s);
+}
+
+fn writeIntString(jw: *json.Stringify, val: i64) !void {
+    var buf: [24]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{d}", .{val}) catch unreachable;
+    try jw.write(s);
 }
 
 // tests
@@ -337,9 +666,9 @@ test "buildTracesJson" {
         },
     };
 
-    const json = try exporter.buildTracesJson(&spans);
-    defer allocator.free(json);
+    const json_out = try exporter.buildTracesJson(&spans);
+    defer allocator.free(json_out);
 
-    try std.testing.expect(std.mem.indexOf(u8, json, "test.span") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "test-service") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_out, "test.span") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_out, "test-service") != null);
 }

@@ -27,6 +27,21 @@ const std = @import("std");
 pub const Config = @import("config.zig").Config;
 pub const Span = @import("span.zig").Span;
 pub const Exporter = @import("exporter.zig").Exporter;
+pub const Attribute = @import("attribute.zig").Attribute;
+
+const metrics_mod = @import("metrics.zig");
+pub const Counter = metrics_mod.Counter;
+pub const Gauge = metrics_mod.Gauge;
+pub const UpDownCounter = metrics_mod.UpDownCounter;
+pub const Histogram = metrics_mod.Histogram;
+pub const ExponentialHistogram = metrics_mod.ExponentialHistogram;
+pub const MetricData = metrics_mod.MetricData;
+pub const NumberDataPoint = metrics_mod.NumberDataPoint;
+pub const HistogramDataPoint = metrics_mod.HistogramDataPoint;
+pub const ExponentialHistogramDataPoint = metrics_mod.ExponentialHistogramDataPoint;
+pub const InstrumentOptions = metrics_mod.InstrumentOptions;
+pub const HistogramOptions = metrics_mod.HistogramOptions;
+pub const AggregationTemporality = metrics_mod.AggregationTemporality;
 
 const log_mod = @import("log.zig");
 pub const Level = log_mod.Level;
@@ -41,9 +56,10 @@ pub const Logfire = struct {
     config: Config,
     exporter: Exporter,
 
-    /// pending spans/logs waiting to be exported
+    /// pending spans/logs/metrics waiting to be exported
     pending_spans: std.ArrayList(Span.Data),
     pending_logs: std.ArrayList(LogRecord),
+    pending_metrics: std.ArrayList(MetricData),
     pending_mutex: std.Thread.Mutex,
 
     /// trace context
@@ -60,6 +76,7 @@ pub const Logfire = struct {
             .exporter = Exporter.init(allocator, resolved),
             .pending_spans = .{},
             .pending_logs = .{},
+            .pending_metrics = .{},
             .pending_mutex = .{},
             .current_trace_id = null,
             .span_id_counter = std.atomic.Value(u64).init(1),
@@ -74,6 +91,7 @@ pub const Logfire = struct {
     pub fn deinit(self: *Logfire) void {
         self.pending_spans.deinit(self.allocator);
         self.pending_logs.deinit(self.allocator);
+        self.pending_metrics.deinit(self.allocator);
         self.exporter.deinit();
         self.allocator.destroy(self);
     }
@@ -96,13 +114,15 @@ pub const Logfire = struct {
         self.pending_mutex.lock();
         defer self.pending_mutex.unlock();
 
-        if (self.pending_spans.items.len > 0 or self.pending_logs.items.len > 0) {
-            try self.exporter.send(
+        if (self.pending_spans.items.len > 0 or self.pending_logs.items.len > 0 or self.pending_metrics.items.len > 0) {
+            try self.exporter.sendAll(
                 self.pending_spans.items,
                 self.pending_logs.items,
+                self.pending_metrics.items,
             );
             self.pending_spans.clearRetainingCapacity();
             self.pending_logs.clearRetainingCapacity();
+            self.pending_metrics.clearRetainingCapacity();
         }
     }
 
@@ -131,6 +151,94 @@ pub const Logfire = struct {
         defer self.pending_mutex.unlock();
         self.pending_spans.append(self.allocator, data) catch {
             std.log.warn("logfire: failed to record span", .{});
+        };
+    }
+
+    pub fn recordMetric(self: *Logfire, data: MetricData) void {
+        self.pending_mutex.lock();
+        defer self.pending_mutex.unlock();
+        self.pending_metrics.append(self.allocator, data) catch {
+            std.log.warn("logfire: failed to record metric", .{});
+        };
+    }
+
+    /// record a counter value (monotonic sum)
+    pub fn recordCounter(self: *Logfire, name: []const u8, value: i64, opts: InstrumentOptions) void {
+        const now = std.time.nanoTimestamp();
+        const dp = self.allocator.create(NumberDataPoint) catch return;
+        dp.* = .{
+            .start_time_ns = now,
+            .time_ns = now,
+            .value = .{ .int = value },
+        };
+
+        self.pending_mutex.lock();
+        defer self.pending_mutex.unlock();
+        self.pending_metrics.append(self.allocator, .{
+            .name = name,
+            .description = opts.description,
+            .unit = opts.unit,
+            .data = .{
+                .sum = .{
+                    .data_points = @as(*const [1]NumberDataPoint, dp),
+                    .temporality = .cumulative,
+                    .is_monotonic = true,
+                },
+            },
+        }) catch {
+            self.allocator.destroy(dp);
+        };
+    }
+
+    /// record a gauge value (instantaneous)
+    pub fn recordGaugeInt(self: *Logfire, name: []const u8, value: i64, opts: InstrumentOptions) void {
+        const now = std.time.nanoTimestamp();
+        const dp = self.allocator.create(NumberDataPoint) catch return;
+        dp.* = .{
+            .start_time_ns = now,
+            .time_ns = now,
+            .value = .{ .int = value },
+        };
+
+        self.pending_mutex.lock();
+        defer self.pending_mutex.unlock();
+        self.pending_metrics.append(self.allocator, .{
+            .name = name,
+            .description = opts.description,
+            .unit = opts.unit,
+            .data = .{
+                .gauge = .{
+                    .data_points = @as(*const [1]NumberDataPoint, dp),
+                },
+            },
+        }) catch {
+            self.allocator.destroy(dp);
+        };
+    }
+
+    /// record a gauge value (instantaneous, f64)
+    pub fn recordGaugeDouble(self: *Logfire, name: []const u8, value: f64, opts: InstrumentOptions) void {
+        const now = std.time.nanoTimestamp();
+        const dp = self.allocator.create(NumberDataPoint) catch return;
+        dp.* = .{
+            .start_time_ns = now,
+            .time_ns = now,
+            .value = .{ .double = value },
+        };
+
+        self.pending_mutex.lock();
+        defer self.pending_mutex.unlock();
+        self.pending_metrics.append(self.allocator, .{
+            .name = name,
+            .description = opts.description,
+            .unit = opts.unit,
+            .data = .{
+                .gauge = .{
+                    .data_points = @as(*const [1]NumberDataPoint, dp),
+                },
+            },
+        }) catch {
+            self.allocator.destroy(dp);
         };
     }
 
@@ -199,6 +307,38 @@ fn logWithLevel(level: Level, comptime fmt: []const u8, args: anytype) void {
     }
 }
 
+// metric convenience functions
+
+pub fn counter(name: []const u8, value: i64) void {
+    if (getInstance()) |lf| {
+        lf.recordCounter(name, value, .{});
+    }
+}
+
+pub fn counterWithOpts(name: []const u8, value: i64, opts: InstrumentOptions) void {
+    if (getInstance()) |lf| {
+        lf.recordCounter(name, value, opts);
+    }
+}
+
+pub fn gaugeInt(name: []const u8, value: i64) void {
+    if (getInstance()) |lf| {
+        lf.recordGaugeInt(name, value, .{});
+    }
+}
+
+pub fn gaugeDouble(name: []const u8, value: f64) void {
+    if (getInstance()) |lf| {
+        lf.recordGaugeDouble(name, value, .{});
+    }
+}
+
+pub fn metric(data: MetricData) void {
+    if (getInstance()) |lf| {
+        lf.recordMetric(data);
+    }
+}
+
 // tests
 
 test "basic configuration" {
@@ -236,10 +376,25 @@ test "logging" {
     try std.testing.expectEqual(@as(usize, 1), lf.pending_logs.items.len);
 }
 
+test "metrics recording" {
+    const lf = try configure(.{
+        .service_name = "test-service",
+        .send_to_logfire = .no,
+    });
+    defer lf.shutdown();
+
+    counter("requests.total", 1);
+    gaugeInt("connections.active", 42);
+
+    try std.testing.expectEqual(@as(usize, 2), lf.pending_metrics.items.len);
+}
+
 // re-export tests from submodules
 test {
     _ = @import("config.zig");
     _ = @import("exporter.zig");
     _ = @import("span.zig");
     _ = @import("log.zig");
+    _ = @import("attribute.zig");
+    _ = @import("metrics.zig");
 }
