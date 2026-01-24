@@ -655,21 +655,31 @@ fn writeIntString(jw: *json.Stringify, val: i64) !void {
 
 /// write a string value with proper JSON escaping
 /// uses raw mode to maintain Stringify state while writing manually
+/// escapes control chars and non-ASCII bytes to ensure valid JSON
 fn writeStringValue(jw: *json.Stringify, s: []const u8) !void {
     try jw.beginWriteRaw();
     try jw.writer.writeByte('"');
     for (s) |c| {
         switch (c) {
+            // characters that need escaping in JSON
             '"' => try jw.writer.writeAll("\\\""),
             '\\' => try jw.writer.writeAll("\\\\"),
             '\n' => try jw.writer.writeAll("\\n"),
             '\r' => try jw.writer.writeAll("\\r"),
             '\t' => try jw.writer.writeAll("\\t"),
-            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f => {
+            // control characters (0x00-0x1f except \n \r \t, plus DEL 0x7f)
+            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f, 0x7f => {
                 var buf: [6]u8 = undefined;
                 _ = std.fmt.bufPrint(&buf, "\\u00{x:0>2}", .{c}) catch unreachable;
                 try jw.writer.writeAll(&buf);
             },
+            // non-ASCII bytes (0x80-0xFF) - escape to avoid invalid UTF-8 issues
+            0x80...0xff => {
+                var buf: [6]u8 = undefined;
+                _ = std.fmt.bufPrint(&buf, "\\u00{x:0>2}", .{c}) catch unreachable;
+                try jw.writer.writeAll(&buf);
+            },
+            // printable ASCII (0x20-0x7e except " and \) - safe to pass through
             else => try jw.writer.writeByte(c),
         }
     }
@@ -747,4 +757,135 @@ test "buildTracesJson" {
 
     try std.testing.expect(std.mem.indexOf(u8, json_out, "test.span") != null);
     try std.testing.expect(std.mem.indexOf(u8, json_out, "test-service") != null);
+}
+
+test "buildTracesJson with string attributes" {
+    const allocator = std.testing.allocator;
+    var config = Config{
+        .service_name = "test-service",
+        .send_to_logfire = .no,
+    };
+    config = config.resolve();
+
+    var exporter = Exporter.init(allocator, config);
+    defer exporter.deinit();
+
+    // create span with string attributes
+    var span_data = Span.Data{
+        .name = "test.span",
+        .trace_id = [_]u8{0x01} ** 16,
+        .span_id = [_]u8{0x02} ** 8,
+        .start_time_ns = 1000,
+        .end_time_ns = 2000,
+    };
+
+    // add string attributes manually
+    span_data.attribute_count = Attribute.fromStruct(.{
+        .query = "hello world",
+        .tag = "python",
+    }, &span_data.attributes);
+
+    const spans = [_]Span.Data{span_data};
+    const json_out = try exporter.buildTracesJson(&spans);
+    defer allocator.free(json_out);
+
+
+    // verify attributes are present
+    try std.testing.expect(std.mem.indexOf(u8, json_out, "\"query\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_out, "\"hello world\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_out, "\"tag\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_out, "\"python\"") != null);
+
+    // parse with std.json to verify it's valid JSON
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_out, .{}) catch |err| {
+        std.debug.print("JSON parse error: {}\n", .{err});
+        return err;
+    };
+    defer parsed.deinit();
+}
+
+test "buildTracesJson with special characters" {
+    const allocator = std.testing.allocator;
+    var config = Config{
+        .service_name = "test-service",
+        .send_to_logfire = .no,
+    };
+    config = config.resolve();
+
+    var exporter = Exporter.init(allocator, config);
+    defer exporter.deinit();
+
+    var span_data = Span.Data{
+        .name = "test.span",
+        .trace_id = [_]u8{0x01} ** 16,
+        .span_id = [_]u8{0x02} ** 8,
+        .start_time_ns = 1000,
+        .end_time_ns = 2000,
+    };
+
+    // test various special characters
+    span_data.attribute_count = Attribute.fromStruct(.{
+        .query = "hello \"world\" & <test>",
+        .unicode = "café résumé",
+        .control = "tab\there",
+        .backslash = "path\\to\\file",
+        .newline = "line1\nline2",
+    }, &span_data.attributes);
+
+    const spans = [_]Span.Data{span_data};
+    const json_out = try exporter.buildTracesJson(&spans);
+    defer allocator.free(json_out);
+
+
+    // verify escapes are present
+    try std.testing.expect(std.mem.indexOf(u8, json_out, "\\\"world\\\"") != null); // escaped quotes
+    try std.testing.expect(std.mem.indexOf(u8, json_out, "\\\\to\\\\") != null); // escaped backslashes
+    try std.testing.expect(std.mem.indexOf(u8, json_out, "\\t") != null); // escaped tab
+    try std.testing.expect(std.mem.indexOf(u8, json_out, "\\n") != null); // escaped newline
+
+    // verify it parses as valid JSON
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_out, .{}) catch |err| {
+        std.debug.print("JSON parse error: {}\n", .{err});
+        return err;
+    };
+    defer parsed.deinit();
+}
+
+test "buildTracesJson with raw bytes" {
+    const allocator = std.testing.allocator;
+    var config = Config{
+        .service_name = "test-service",
+        .send_to_logfire = .no,
+    };
+    config = config.resolve();
+
+    var exporter = Exporter.init(allocator, config);
+    defer exporter.deinit();
+
+    var span_data = Span.Data{
+        .name = "test.span",
+        .trace_id = [_]u8{0x01} ** 16,
+        .span_id = [_]u8{0x02} ** 8,
+        .start_time_ns = 1000,
+        .end_time_ns = 2000,
+    };
+
+    // test raw bytes that might come from malformed URL decoding
+    // these include invalid UTF-8 sequences
+    span_data.attribute_count = Attribute.fromStruct(.{
+        .query = "test\x80\x81\x82value", // invalid UTF-8 bytes
+        .ctrl = "null\x00byte", // null byte
+    }, &span_data.attributes);
+
+    const spans = [_]Span.Data{span_data};
+    const json_out = try exporter.buildTracesJson(&spans);
+    defer allocator.free(json_out);
+
+
+    // now that we escape non-ASCII, this should parse successfully
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_out, .{}) catch |err| {
+        std.debug.print("JSON parse error: {}\n", .{err});
+        return err;
+    };
+    defer parsed.deinit();
 }

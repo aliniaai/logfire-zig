@@ -25,10 +25,12 @@ pub fn main() !void {
     logfire.info("application started", .{});
     logfire.debug("debug message with value: {d}", .{42});
 
-    // span with timing
+    // span with timing and string attributes
     {
         const s = logfire.span("example.work", .{
             .iteration = @as(i64, 1),
+            .query = "prefect python",
+            .tag = "python",
         });
         defer s.end();
 
@@ -36,6 +38,29 @@ pub fn main() !void {
         std.posix.nanosleep(0, 10 * std.time.ns_per_ms);
 
         logfire.info("work completed", .{});
+    }
+
+    // span with dynamic string (simulating arena-allocated query)
+    {
+        var buf: [64]u8 = undefined;
+        const query = std.fmt.bufPrint(&buf, "search query {d}", .{42}) catch "fallback";
+
+        const s = logfire.span("example.dynamic_string", .{
+            .query = query,
+        });
+        defer s.end();
+
+        std.posix.nanosleep(0, 5 * std.time.ns_per_ms);
+    }
+
+    // span with special characters that might come from URL params
+    {
+        const s = logfire.span("example.special_chars", .{
+            .query = "hello \"world\" & <test>",
+            .unicode = "café résumé naïve",
+            .control = "tab\there\nnewline",
+        });
+        defer s.end();
     }
 
     // nested spans
