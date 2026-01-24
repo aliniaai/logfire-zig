@@ -33,12 +33,12 @@ pub const Span = struct {
     };
 
     /// create a span (called by Logfire.createSpan)
-    pub fn init(logfire: *root.Logfire, name: []const u8, span_id_num: u64, attrs: anytype) Span {
+    pub fn init(logfire: *root.Logfire, name: []const u8, span_id_num: u64, trace_id: ?[16]u8, attrs: anytype) Span {
         var s = Span{
             .logfire = logfire,
             .data = .{
                 .name = name,
-                .trace_id = logfire.current_trace_id orelse [_]u8{0} ** 16,
+                .trace_id = trace_id orelse [_]u8{0} ** 16,
                 .span_id = undefined,
                 .start_time_ns = std.time.nanoTimestamp(),
                 .end_time_ns = 0,

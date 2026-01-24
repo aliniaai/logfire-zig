@@ -51,6 +51,10 @@ pub const LogRecord = log_mod.LogRecord;
 var global_instance: ?*Logfire = null;
 var global_mutex: std.Thread.Mutex = .{};
 
+/// thread-local trace context - each thread gets its own trace
+threadlocal var tl_trace_id: ?[16]u8 = null;
+threadlocal var tl_active_span_count: u32 = 0;
+
 pub const Logfire = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -65,9 +69,7 @@ pub const Logfire = struct {
     /// allocated data points (freed on flush)
     allocated_data_points: std.ArrayList(*NumberDataPoint),
 
-    /// trace context
-    current_trace_id: ?[16]u8,
-    active_span_count: std.atomic.Value(u32),
+    /// span ID counter (global, just needs to be unique)
     span_id_counter: std.atomic.Value(u64),
 
     /// background flush thread
@@ -87,8 +89,6 @@ pub const Logfire = struct {
             .pending_metrics = .{},
             .pending_mutex = .{},
             .allocated_data_points = .{},
-            .current_trace_id = null,
-            .active_span_count = std.atomic.Value(u32).init(0),
             .span_id_counter = std.atomic.Value(u64).init(1),
             .flush_thread = null,
             .running = std.atomic.Value(bool).init(true),
@@ -170,27 +170,37 @@ pub const Logfire = struct {
     }
 
     pub fn createSpan(self: *Logfire, name: []const u8, attributes: anytype) Span {
-        // generate new trace ID if no active spans (root span)
-        if (self.active_span_count.fetchAdd(1, .acquire) == 0) {
-            self.current_trace_id = generateTraceId();
+        // generate new trace ID if no active spans on this thread
+        if (tl_active_span_count == 0) {
+            tl_trace_id = generateTraceId();
         }
+        tl_active_span_count += 1;
         const span_id = self.span_id_counter.fetchAdd(1, .monotonic);
-        return Span.init(self, name, span_id, attributes);
+        return Span.init(self, name, span_id, tl_trace_id, attributes);
     }
 
     /// called when a span ends to track active span count
     pub fn spanEnded(self: *Logfire) void {
-        _ = self.active_span_count.fetchSub(1, .release);
+        _ = self;
+        if (tl_active_span_count > 0) {
+            tl_active_span_count -= 1;
+        }
     }
 
-    /// start a new trace (generates new trace ID)
+    /// start a new trace (generates new trace ID for this thread)
     pub fn newTrace(self: *Logfire) void {
-        self.current_trace_id = generateTraceId();
+        _ = self;
+        tl_trace_id = generateTraceId();
+    }
+
+    /// get the current thread's trace ID
+    pub fn currentTraceId() ?[16]u8 {
+        return tl_trace_id;
     }
 
     pub fn recordLog(self: *Logfire, level: Level, message: []const u8, attributes: anytype) void {
         const record = LogRecord.init(
-            self.current_trace_id,
+            tl_trace_id,
             level,
             message,
             attributes,
