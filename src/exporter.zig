@@ -612,7 +612,8 @@ fn writeAttributeFromAttr(jw: *json.Stringify, attr: Attribute) !void {
     switch (attr.value) {
         .string => |s| {
             try jw.objectField("stringValue");
-            try jw.write(s);
+            // explicit cast needed for slices pointing to internal storage
+            try jw.write(@as([]const u8, s));
         },
         .int => |i| {
             try jw.objectField("intValue");
