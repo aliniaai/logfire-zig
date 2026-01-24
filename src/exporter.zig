@@ -295,7 +295,7 @@ pub const Exporter = struct {
 
         try jw.objectField("attributes");
         try jw.beginArray();
-        for (s.attributes[0..s.attribute_count]) |attr| {
+        for (s.attributes[0..s.attribute_count]) |*attr| {
             try writeAttributeFromAttr(jw, attr);
         }
         try jw.endArray();
@@ -335,7 +335,7 @@ pub const Exporter = struct {
 
         try jw.objectField("attributes");
         try jw.beginArray();
-        for (log.attributes[0..log.attribute_count]) |attr| {
+        for (log.attributes[0..log.attribute_count]) |*attr| {
             try writeAttributeFromAttr(jw, attr);
         }
         try jw.endArray();
@@ -445,7 +445,7 @@ fn writeNumberDataPointObject(jw: *json.Stringify, dp: metrics_mod.NumberDataPoi
     // attributes - always include even if empty
     try jw.objectField("attributes");
     try jw.beginArray();
-    for (dp.attributes) |attr| {
+    for (dp.attributes) |*attr| {
         try writeAttributeFromAttr(jw, attr);
     }
     try jw.endArray();
@@ -508,7 +508,7 @@ fn writeHistogramDataPointObject(jw: *json.Stringify, dp: metrics_mod.HistogramD
     if (dp.attributes.len > 0) {
         try jw.objectField("attributes");
         try jw.beginArray();
-        for (dp.attributes) |attr| {
+        for (dp.attributes) |*attr| {
             try writeAttributeFromAttr(jw, attr);
         }
         try jw.endArray();
@@ -559,7 +559,7 @@ fn writeExponentialHistogramDataPointObject(jw: *json.Stringify, dp: metrics_mod
     if (dp.attributes.len > 0) {
         try jw.objectField("attributes");
         try jw.beginArray();
-        for (dp.attributes) |attr| {
+        for (dp.attributes) |*attr| {
             try writeAttributeFromAttr(jw, attr);
         }
         try jw.endArray();
@@ -603,16 +603,16 @@ fn writeAttributeObject(jw: *json.Stringify, key: []const u8, value: AttributeVa
     try jw.endObject();
 }
 
-fn writeAttributeFromAttr(jw: *json.Stringify, attr: Attribute) !void {
+fn writeAttributeFromAttr(jw: *json.Stringify, attr: *const Attribute) !void {
     try jw.beginObject();
     try jw.objectField("key");
     try jw.write(attr.key);
     try jw.objectField("value");
     try jw.beginObject();
     switch (attr.value) {
-        .string => |s| {
+        .string => {
             try jw.objectField("stringValue");
-            try writeStringValue(jw, s);
+            try writeStringValue(jw, attr.getString().?);
         },
         .int => |i| {
             try jw.objectField("intValue");
