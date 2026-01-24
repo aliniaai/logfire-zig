@@ -584,7 +584,7 @@ fn writeAttributeObject(jw: *json.Stringify, key: []const u8, value: AttributeVa
     switch (value) {
         .string => |s| {
             try jw.objectField("stringValue");
-            try jw.write(s);
+            try writeStringValue(jw, s);
         },
         .int => |i| {
             try jw.objectField("intValue");
@@ -612,8 +612,7 @@ fn writeAttributeFromAttr(jw: *json.Stringify, attr: Attribute) !void {
     switch (attr.value) {
         .string => |s| {
             try jw.objectField("stringValue");
-            // explicit cast needed for slices pointing to internal storage
-            try jw.write(@as([]const u8, s));
+            try writeStringValue(jw, s);
         },
         .int => |i| {
             try jw.objectField("intValue");
@@ -652,6 +651,30 @@ fn writeIntString(jw: *json.Stringify, val: i64) !void {
     var buf: [24]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, "{d}", .{val}) catch unreachable;
     try jw.write(s);
+}
+
+/// write a string value with proper JSON escaping
+/// uses raw mode to maintain Stringify state while writing manually
+fn writeStringValue(jw: *json.Stringify, s: []const u8) !void {
+    try jw.beginWriteRaw();
+    try jw.writer.writeByte('"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try jw.writer.writeAll("\\\""),
+            '\\' => try jw.writer.writeAll("\\\\"),
+            '\n' => try jw.writer.writeAll("\\n"),
+            '\r' => try jw.writer.writeAll("\\r"),
+            '\t' => try jw.writer.writeAll("\\t"),
+            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f => {
+                var buf: [6]u8 = undefined;
+                _ = std.fmt.bufPrint(&buf, "\\u00{x:0>2}", .{c}) catch unreachable;
+                try jw.writer.writeAll(&buf);
+            },
+            else => try jw.writer.writeByte(c),
+        }
+    }
+    try jw.writer.writeByte('"');
+    jw.endWriteRaw();
 }
 
 // tests
