@@ -109,8 +109,14 @@ pub const Exporter = struct {
         }) catch return error.RequestFailed;
 
         if (result.status != .ok and result.status != .accepted) {
-            std.log.warn("logfire: export failed: {s}", .{aw.toArrayList().items});
+            std.log.warn("logfire: export to {s} failed ({s}): {s}", .{ path, @tagName(result.status), aw.toArrayList().items });
             return error.SendFailed;
+        }
+
+        // OTLP partial_success response indicates rejected data points
+        const response = aw.toArrayList().items;
+        if (response.len > 0) {
+            std.log.debug("logfire: {s} response: {s}", .{ path, response });
         }
     }
 
@@ -202,7 +208,7 @@ pub const Exporter = struct {
         return output.toOwnedSlice();
     }
 
-    fn buildMetricsJson(self: *Exporter, metrics: []const MetricData) ![]u8 {
+    pub fn buildMetricsJson(self: *Exporter, metrics: []const MetricData) ![]u8 {
         var output: std.Io.Writer.Allocating = .init(self.allocator);
         errdefer output.deinit();
         var jw: json.Stringify = .{ .writer = &output.writer };
@@ -431,6 +437,14 @@ fn writeMetricObject(jw: *json.Stringify, metric: MetricData) !void {
 fn writeNumberDataPointObject(jw: *json.Stringify, dp: metrics_mod.NumberDataPoint) !void {
     try jw.beginObject();
 
+    // attributes - always include even if empty
+    try jw.objectField("attributes");
+    try jw.beginArray();
+    for (dp.attributes) |attr| {
+        try writeAttributeFromAttr(jw, attr);
+    }
+    try jw.endArray();
+
     try jw.objectField("startTimeUnixNano");
     try writeNsString(jw, dp.start_time_ns);
 
@@ -440,21 +454,12 @@ fn writeNumberDataPointObject(jw: *json.Stringify, dp: metrics_mod.NumberDataPoi
     switch (dp.value) {
         .int => |v| {
             try jw.objectField("asInt");
-            try writeIntString(jw, v);
+            try jw.write(v); // asInt is a number, not a string
         },
         .double => |v| {
             try jw.objectField("asDouble");
             try jw.write(v);
         },
-    }
-
-    if (dp.attributes.len > 0) {
-        try jw.objectField("attributes");
-        try jw.beginArray();
-        for (dp.attributes) |attr| {
-            try writeAttributeFromAttr(jw, attr);
-        }
-        try jw.endArray();
     }
 
     try jw.endObject();
@@ -470,7 +475,7 @@ fn writeHistogramDataPointObject(jw: *json.Stringify, dp: metrics_mod.HistogramD
     try writeNsString(jw, dp.time_ns);
 
     try jw.objectField("count");
-    try writeIntString(jw, @intCast(dp.count));
+    try jw.write(dp.count); // number, not string
 
     try jw.objectField("sum");
     try jw.write(dp.sum);
@@ -478,7 +483,7 @@ fn writeHistogramDataPointObject(jw: *json.Stringify, dp: metrics_mod.HistogramD
     try jw.objectField("bucketCounts");
     try jw.beginArray();
     for (dp.bucket_counts) |c| {
-        try writeIntString(jw, @intCast(c));
+        try jw.write(c); // numbers, not strings
     }
     try jw.endArray();
 
@@ -517,7 +522,7 @@ fn writeExponentialHistogramDataPointObject(jw: *json.Stringify, dp: metrics_mod
     try writeNsString(jw, dp.time_ns);
 
     try jw.objectField("count");
-    try writeIntString(jw, @intCast(dp.count));
+    try jw.write(dp.count); // number, not string
 
     try jw.objectField("sum");
     try jw.write(dp.sum);
@@ -526,7 +531,7 @@ fn writeExponentialHistogramDataPointObject(jw: *json.Stringify, dp: metrics_mod
     try jw.write(@as(i64, dp.scale));
 
     try jw.objectField("zeroCount");
-    try writeIntString(jw, @intCast(dp.zero_count));
+    try jw.write(dp.zero_count); // number, not string
 
     try jw.objectField("positive");
     try jw.beginObject();
@@ -535,7 +540,7 @@ fn writeExponentialHistogramDataPointObject(jw: *json.Stringify, dp: metrics_mod
     try jw.objectField("bucketCounts");
     try jw.beginArray();
     for (dp.positive_bucket_counts) |c| {
-        try writeIntString(jw, @intCast(c));
+        try jw.write(c); // numbers, not strings
     }
     try jw.endArray();
     try jw.endObject();
@@ -644,6 +649,48 @@ fn writeIntString(jw: *json.Stringify, val: i64) !void {
 }
 
 // tests
+
+test "buildMetricsJson" {
+    const allocator = std.testing.allocator;
+    var config = Config{
+        .service_name = "test-service",
+        .send_to_logfire = .no,
+    };
+    config = config.resolve();
+
+    var exporter = Exporter.init(allocator, config);
+    defer exporter.deinit();
+
+    var dp = metrics_mod.NumberDataPoint{
+        .start_time_ns = 1000000000000000000,
+        .time_ns = 1000000000000000000,
+        .value = .{ .int = 42 },
+    };
+
+    const metrics = [_]MetricData{
+        .{
+            .name = "test.counter",
+            .description = "A test counter",
+            .unit = "1",
+            .data = .{
+                .sum = .{
+                    .data_points = @as(*const [1]metrics_mod.NumberDataPoint, &dp),
+                    .temporality = .delta,
+                    .is_monotonic = true,
+                },
+            },
+        },
+    };
+
+    const json_out = try exporter.buildMetricsJson(&metrics);
+    defer allocator.free(json_out);
+
+    // verify structure
+    try std.testing.expect(std.mem.indexOf(u8, json_out, "test.counter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_out, "\"aggregationTemporality\":1") != null); // delta=1
+    try std.testing.expect(std.mem.indexOf(u8, json_out, "\"isMonotonic\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_out, "\"asInt\":42") != null);
+}
 
 test "buildTracesJson" {
     const allocator = std.testing.allocator;
