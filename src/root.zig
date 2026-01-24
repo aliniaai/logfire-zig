@@ -66,6 +66,10 @@ pub const Logfire = struct {
     current_trace_id: ?[16]u8,
     span_id_counter: std.atomic.Value(u64),
 
+    /// background flush thread
+    flush_thread: ?std.Thread,
+    running: std.atomic.Value(bool),
+
     pub fn init(allocator: std.mem.Allocator, config: Config) !*Logfire {
         const resolved = config.resolve();
 
@@ -80,12 +84,30 @@ pub const Logfire = struct {
             .pending_mutex = .{},
             .current_trace_id = null,
             .span_id_counter = std.atomic.Value(u64).init(1),
+            .flush_thread = null,
+            .running = std.atomic.Value(bool).init(true),
         };
 
         // generate initial trace id
         self.current_trace_id = generateTraceId();
 
+        // start background flush thread
+        if (resolved.batch_timeout_ms > 0) {
+            self.flush_thread = std.Thread.spawn(.{}, flushLoop, .{self}) catch null;
+        }
+
         return self;
+    }
+
+    fn flushLoop(self: *Logfire) void {
+        const interval_ns = self.config.batch_timeout_ms * std.time.ns_per_ms;
+        while (self.running.load(.acquire)) {
+            std.Thread.sleep(interval_ns);
+            if (!self.running.load(.acquire)) break;
+            self.flush() catch |e| {
+                std.log.warn("logfire: background flush failed: {}", .{e});
+            };
+        }
     }
 
     pub fn deinit(self: *Logfire) void {
@@ -97,6 +119,13 @@ pub const Logfire = struct {
     }
 
     pub fn shutdown(self: *Logfire) void {
+        // stop flush thread
+        self.running.store(false, .release);
+        if (self.flush_thread) |t| {
+            t.join();
+        }
+
+        // final flush
         self.flush() catch |e| {
             std.log.warn("logfire: flush failed during shutdown: {}", .{e});
         };
