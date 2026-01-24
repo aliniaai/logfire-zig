@@ -26,6 +26,7 @@ pub const Span = struct {
         name: []const u8,
         trace_id: [16]u8,
         span_id: [8]u8,
+        parent_span_id: ?[8]u8 = null,
         start_time_ns: i128,
         end_time_ns: i128,
         attributes: [max_attributes]Attribute = undefined,
@@ -33,21 +34,19 @@ pub const Span = struct {
     };
 
     /// create a span (called by Logfire.createSpan)
-    pub fn init(logfire: *root.Logfire, name: []const u8, span_id_num: u64, trace_id: ?[16]u8, attrs: anytype) Span {
+    pub fn init(logfire: *root.Logfire, name: []const u8, span_id: [8]u8, trace_id: ?[16]u8, parent_span_id: ?[8]u8, attrs: anytype) Span {
         var s = Span{
             .logfire = logfire,
             .data = .{
                 .name = name,
                 .trace_id = trace_id orelse [_]u8{0} ** 16,
-                .span_id = undefined,
+                .span_id = span_id,
+                .parent_span_id = parent_span_id,
                 .start_time_ns = std.time.nanoTimestamp(),
                 .end_time_ns = 0,
             },
             .active = true,
         };
-
-        // encode span ID from counter
-        std.mem.writeInt(u64, &s.data.span_id, span_id_num, .big);
 
         // store attributes
         s.data.attribute_count = Attribute.fromStruct(attrs, &s.data.attributes);
@@ -77,7 +76,7 @@ pub const Span = struct {
             var data = self.data;
             data.end_time_ns = std.time.nanoTimestamp();
             lf.recordSpanEnd(data);
-            lf.spanEnded();
+            lf.spanEnded(self.data.parent_span_id);
         }
     }
 };

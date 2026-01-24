@@ -53,6 +53,7 @@ var global_mutex: std.Thread.Mutex = .{};
 
 /// thread-local trace context - each thread gets its own trace
 threadlocal var tl_trace_id: ?[16]u8 = null;
+threadlocal var tl_current_span_id: ?[8]u8 = null;
 threadlocal var tl_active_span_count: u32 = 0;
 
 pub const Logfire = struct {
@@ -175,16 +176,29 @@ pub const Logfire = struct {
             tl_trace_id = generateTraceId();
         }
         tl_active_span_count += 1;
+
+        // capture parent span ID before creating new span
+        const parent_span_id = tl_current_span_id;
         const span_id = self.span_id_counter.fetchAdd(1, .monotonic);
-        return Span.init(self, name, span_id, tl_trace_id, attributes);
+
+        // encode span ID
+        var span_id_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &span_id_bytes, span_id, .big);
+
+        // update current span ID for this thread
+        tl_current_span_id = span_id_bytes;
+
+        return Span.init(self, name, span_id_bytes, tl_trace_id, parent_span_id, attributes);
     }
 
-    /// called when a span ends to track active span count
-    pub fn spanEnded(self: *Logfire) void {
+    /// called when a span ends to restore parent context
+    pub fn spanEnded(self: *Logfire, parent_span_id: ?[8]u8) void {
         _ = self;
         if (tl_active_span_count > 0) {
             tl_active_span_count -= 1;
         }
+        // restore parent as current span
+        tl_current_span_id = parent_span_id;
     }
 
     /// start a new trace (generates new trace ID for this thread)
@@ -476,6 +490,39 @@ test "metrics recording" {
     gaugeInt("connections.active", 42);
 
     try std.testing.expectEqual(@as(usize, 2), lf.pending_metrics.items.len);
+}
+
+test "parent-child span linking" {
+    const lf = try configure(.{
+        .service_name = "test-service",
+        .send_to_logfire = .no,
+    });
+    defer lf.shutdown();
+
+    // create parent span
+    const parent = span("parent.operation", .{});
+    const parent_span_id = parent.data.span_id;
+    const parent_trace_id = parent.data.trace_id;
+
+    // parent should have no parent
+    try std.testing.expect(parent.data.parent_span_id == null);
+
+    // create child span while parent is active
+    const child = span("child.operation", .{});
+
+    // child should have parent's span_id as parent_span_id
+    try std.testing.expect(child.data.parent_span_id != null);
+    try std.testing.expectEqualSlices(u8, &parent_span_id, &child.data.parent_span_id.?);
+
+    // child should share parent's trace_id
+    try std.testing.expectEqualSlices(u8, &parent_trace_id, &child.data.trace_id);
+
+    // end spans (child first due to defer order)
+    child.end();
+    parent.end();
+
+    // should have recorded 2 spans
+    try std.testing.expectEqual(@as(usize, 2), lf.pending_spans.items.len);
 }
 
 // re-export tests from submodules

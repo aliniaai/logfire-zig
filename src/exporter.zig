@@ -276,6 +276,11 @@ pub const Exporter = struct {
         try jw.objectField("spanId");
         try writeHexString(jw, &s.span_id);
 
+        if (s.parent_span_id) |parent_id| {
+            try jw.objectField("parentSpanId");
+            try writeHexString(jw, &parent_id);
+        }
+
         try jw.objectField("name");
         try jw.write(s.name);
 
