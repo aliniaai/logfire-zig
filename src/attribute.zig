@@ -1,12 +1,18 @@
 //! OTLP attribute types
 //!
 //! converts zig values to OTLP-compatible attribute format.
+//! string values are copied into internal storage for memory safety.
 
 const std = @import("std");
 
 pub const Attribute = struct {
     key: []const u8,
     value: Value,
+    /// internal storage for copied strings
+    _string_storage: [max_string_len]u8 = undefined,
+    _string_len: usize = 0,
+
+    pub const max_string_len = 512;
 
     pub const Value = union(enum) {
         string: []const u8,
@@ -15,8 +21,17 @@ pub const Attribute = struct {
         bool_val: bool,
     };
 
+    /// copy a string into internal storage and return slice pointing to it
+    fn copyString(self: *Attribute, str: []const u8) []const u8 {
+        const len = @min(str.len, max_string_len);
+        @memcpy(self._string_storage[0..len], str[0..len]);
+        self._string_len = len;
+        return self._string_storage[0..len];
+    }
+
     /// convert a comptime struct to attributes array
     /// returns number of attributes written
+    /// string values are copied for memory safety
     pub fn fromStruct(attrs: anytype, out: []Attribute) usize {
         const T = @TypeOf(attrs);
         const info = @typeInfo(T);
@@ -30,11 +45,7 @@ pub const Attribute = struct {
             if (count >= out.len) break;
 
             const field_value = @field(attrs, field.name);
-            if (toValue(field_value)) |value| {
-                out[count] = .{
-                    .key = field.name,
-                    .value = value,
-                };
+            if (toValueWithCopy(&out[count], field.name, field_value)) {
                 count += 1;
             }
         }
@@ -42,42 +53,60 @@ pub const Attribute = struct {
         return count;
     }
 
-    /// convert a zig value to an attribute value
-    fn toValue(value: anytype) ?Value {
+    /// convert value and copy strings into attribute's internal storage
+    fn toValueWithCopy(attr: *Attribute, key: []const u8, value: anytype) bool {
         const T = @TypeOf(value);
         const info = @typeInfo(T);
 
-        return switch (info) {
-            .int, .comptime_int => .{ .int = @intCast(value) },
-            .float, .comptime_float => .{ .float = @floatCast(value) },
-            .bool => .{ .bool_val = value },
+        switch (info) {
+            .int, .comptime_int => {
+                attr.* = .{ .key = key, .value = .{ .int = @intCast(value) } };
+                return true;
+            },
+            .float, .comptime_float => {
+                attr.* = .{ .key = key, .value = .{ .float = @floatCast(value) } };
+                return true;
+            },
+            .bool => {
+                attr.* = .{ .key = key, .value = .{ .bool_val = value } };
+                return true;
+            },
             .pointer => |ptr| {
                 if (ptr.size == .slice and ptr.child == u8) {
-                    return .{ .string = value };
+                    // copy the string into internal storage
+                    attr.* = .{ .key = key, .value = undefined };
+                    const copied = attr.copyString(value);
+                    attr.value = .{ .string = copied };
+                    return true;
                 }
                 if (ptr.size == .one) {
-                    // pointer to array (e.g., *const [N]u8)
                     const child_info = @typeInfo(ptr.child);
                     if (child_info == .array and child_info.array.child == u8) {
-                        return .{ .string = value };
+                        attr.* = .{ .key = key, .value = undefined };
+                        const copied = attr.copyString(value);
+                        attr.value = .{ .string = copied };
+                        return true;
                     }
                 }
-                return null;
+                return false;
             },
             .array => |arr| {
                 if (arr.child == u8) {
-                    return .{ .string = &value };
+                    attr.* = .{ .key = key, .value = undefined };
+                    const copied = attr.copyString(&value);
+                    attr.value = .{ .string = copied };
+                    return true;
                 }
-                return null;
+                return false;
             },
             .optional => {
                 if (value) |v| {
-                    return toValue(v);
+                    return toValueWithCopy(attr, key, v);
                 }
-                return null;
+                return false;
             },
-            else => null,
-        };
+            else => return false,
+        }
     }
 
     /// write attribute as OTLP JSON
