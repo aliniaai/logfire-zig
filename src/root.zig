@@ -62,8 +62,12 @@ pub const Logfire = struct {
     pending_metrics: std.ArrayList(MetricData),
     pending_mutex: std.Thread.Mutex,
 
+    /// allocated data points (freed on flush)
+    allocated_data_points: std.ArrayList(*NumberDataPoint),
+
     /// trace context
     current_trace_id: ?[16]u8,
+    active_span_count: std.atomic.Value(u32),
     span_id_counter: std.atomic.Value(u64),
 
     /// background flush thread
@@ -82,14 +86,13 @@ pub const Logfire = struct {
             .pending_logs = .{},
             .pending_metrics = .{},
             .pending_mutex = .{},
+            .allocated_data_points = .{},
             .current_trace_id = null,
+            .active_span_count = std.atomic.Value(u32).init(0),
             .span_id_counter = std.atomic.Value(u64).init(1),
             .flush_thread = null,
             .running = std.atomic.Value(bool).init(true),
         };
-
-        // generate initial trace id
-        self.current_trace_id = generateTraceId();
 
         // start background flush thread
         if (resolved.batch_timeout_ms > 0) {
@@ -111,6 +114,11 @@ pub const Logfire = struct {
     }
 
     pub fn deinit(self: *Logfire) void {
+        // free any remaining allocated data points
+        for (self.allocated_data_points.items) |dp| {
+            self.allocator.destroy(dp);
+        }
+        self.allocated_data_points.deinit(self.allocator);
         self.pending_spans.deinit(self.allocator);
         self.pending_logs.deinit(self.allocator);
         self.pending_metrics.deinit(self.allocator);
@@ -152,12 +160,32 @@ pub const Logfire = struct {
             self.pending_spans.clearRetainingCapacity();
             self.pending_logs.clearRetainingCapacity();
             self.pending_metrics.clearRetainingCapacity();
+
+            // free allocated data points
+            for (self.allocated_data_points.items) |dp| {
+                self.allocator.destroy(dp);
+            }
+            self.allocated_data_points.clearRetainingCapacity();
         }
     }
 
     pub fn createSpan(self: *Logfire, name: []const u8, attributes: anytype) Span {
+        // generate new trace ID if no active spans (root span)
+        if (self.active_span_count.fetchAdd(1, .acquire) == 0) {
+            self.current_trace_id = generateTraceId();
+        }
         const span_id = self.span_id_counter.fetchAdd(1, .monotonic);
         return Span.init(self, name, span_id, attributes);
+    }
+
+    /// called when a span ends to track active span count
+    pub fn spanEnded(self: *Logfire) void {
+        _ = self.active_span_count.fetchSub(1, .release);
+    }
+
+    /// start a new trace (generates new trace ID)
+    pub fn newTrace(self: *Logfire) void {
+        self.current_trace_id = generateTraceId();
     }
 
     pub fn recordLog(self: *Logfire, level: Level, message: []const u8, attributes: anytype) void {
@@ -191,7 +219,7 @@ pub const Logfire = struct {
         };
     }
 
-    /// record a counter value (monotonic sum)
+    /// record a counter value (monotonic sum, delta temporality)
     pub fn recordCounter(self: *Logfire, name: []const u8, value: i64, opts: InstrumentOptions) void {
         const now = std.time.nanoTimestamp();
         const dp = self.allocator.create(NumberDataPoint) catch return;
@@ -203,6 +231,13 @@ pub const Logfire = struct {
 
         self.pending_mutex.lock();
         defer self.pending_mutex.unlock();
+
+        // track allocation for cleanup
+        self.allocated_data_points.append(self.allocator, dp) catch {
+            self.allocator.destroy(dp);
+            return;
+        };
+
         self.pending_metrics.append(self.allocator, .{
             .name = name,
             .description = opts.description,
@@ -210,13 +245,11 @@ pub const Logfire = struct {
             .data = .{
                 .sum = .{
                     .data_points = @as(*const [1]NumberDataPoint, dp),
-                    .temporality = .cumulative,
+                    .temporality = .delta, // delta since we send individual increments
                     .is_monotonic = true,
                 },
             },
-        }) catch {
-            self.allocator.destroy(dp);
-        };
+        }) catch {};
     }
 
     /// record a gauge value (instantaneous)
@@ -231,6 +264,13 @@ pub const Logfire = struct {
 
         self.pending_mutex.lock();
         defer self.pending_mutex.unlock();
+
+        // track allocation for cleanup
+        self.allocated_data_points.append(self.allocator, dp) catch {
+            self.allocator.destroy(dp);
+            return;
+        };
+
         self.pending_metrics.append(self.allocator, .{
             .name = name,
             .description = opts.description,
@@ -240,9 +280,7 @@ pub const Logfire = struct {
                     .data_points = @as(*const [1]NumberDataPoint, dp),
                 },
             },
-        }) catch {
-            self.allocator.destroy(dp);
-        };
+        }) catch {};
     }
 
     /// record a gauge value (instantaneous, f64)
@@ -257,6 +295,13 @@ pub const Logfire = struct {
 
         self.pending_mutex.lock();
         defer self.pending_mutex.unlock();
+
+        // track allocation for cleanup
+        self.allocated_data_points.append(self.allocator, dp) catch {
+            self.allocator.destroy(dp);
+            return;
+        };
+
         self.pending_metrics.append(self.allocator, .{
             .name = name,
             .description = opts.description,
@@ -266,9 +311,7 @@ pub const Logfire = struct {
                     .data_points = @as(*const [1]NumberDataPoint, dp),
                 },
             },
-        }) catch {
-            self.allocator.destroy(dp);
-        };
+        }) catch {};
     }
 
     fn generateTraceId() [16]u8 {
@@ -304,6 +347,13 @@ pub fn span(name: []const u8, attributes: anytype) Span {
         return lf.createSpan(name, attributes);
     }
     return Span.noop();
+}
+
+/// start a new trace (generates new trace ID for subsequent spans)
+pub fn newTrace() void {
+    if (getInstance()) |lf| {
+        lf.newTrace();
+    }
 }
 
 pub fn trace(comptime fmt: []const u8, args: anytype) void {

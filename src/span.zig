@@ -77,6 +77,7 @@ pub const Span = struct {
             var data = self.data;
             data.end_time_ns = std.time.nanoTimestamp();
             lf.recordSpanEnd(data);
+            lf.spanEnded();
         }
     }
 };
