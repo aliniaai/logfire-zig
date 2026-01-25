@@ -31,6 +31,13 @@ var global_instance: ?*Logfire = null;
 var global_allocator: ?std.mem.Allocator = null;
 
 // ============================================================================
+// thread-local span context tracking for parent-child relationships
+// ============================================================================
+
+/// thread-local current span context - enables parent-child span linking
+threadlocal var tl_current_span_context: ?otel_api.trace.Span.Context = null;
+
+// ============================================================================
 // Logfire - main SDK type
 // ============================================================================
 
@@ -176,16 +183,33 @@ pub const Logfire = struct {
     pub fn createSpan(self: *Self, name: []const u8, attrs: anytype) Span {
         if (self.tracer) |*tracer| {
             const otel_attrs = attrsToOtel(attrs);
-            const ctx = &[_]otel_api.ContextKeyValue{};
+
+            // capture parent context before creating new span
+            const parent_context = tl_current_span_context;
+
+            // build context with parent span if one exists
+            var ctx_storage: [1]otel_api.ContextKeyValue = undefined;
+            const ctx: []const otel_api.ContextKeyValue = if (parent_context) |parent| blk: {
+                ctx_storage[0] = .{
+                    .key = otel_api.trace.context_keys.active_span_context_key.key_id,
+                    .value = otel_api.trace.context_keys.active_span_context_key.wrapValue(parent),
+                };
+                break :blk &ctx_storage;
+            } else &[_]otel_api.ContextKeyValue{};
+
             const span_result = tracer.startSpan(name, .{
                 .kind = .internal,
                 .attributes = otel_attrs,
             }, ctx) catch {
-                return .{ .inner = null };
+                return .{ .inner = null, .parent_context = parent_context };
             };
-            return .{ .inner = span_result };
+
+            // update thread-local context with new span
+            tl_current_span_context = span_result.getSpanContext();
+
+            return .{ .inner = span_result, .parent_context = parent_context };
         }
-        return .{ .inner = null };
+        return .{ .inner = null, .parent_context = null };
     }
 
     // ========================================================================
@@ -211,6 +235,7 @@ pub const Logfire = struct {
 
 pub const Span = struct {
     inner: ?otel_api.trace.Span,
+    parent_context: ?otel_api.trace.Span.Context,
 
     /// end the span - takes *const for API compatibility with legacy logfire
     pub fn end(self: *const Span) void {
@@ -221,6 +246,9 @@ pub const Span = struct {
                 s.end(null);
                 s.deinit();
                 mutable.inner = null;
+
+                // restore parent context (enables proper nesting)
+                tl_current_span_context = mutable.parent_context;
             }
         }
     }
@@ -229,7 +257,9 @@ pub const Span = struct {
         if (self.inner != null) {
             const mutable = @constCast(self);
             if (mutable.inner) |*s| {
-                s.setAttribute(.{ .key = key, .value = toOtelValue(value) });
+                if (toOtelValue(value)) |val| {
+                    s.setAttribute(.{ .key = key, .value = val });
+                }
             }
         }
     }
@@ -251,7 +281,7 @@ pub fn span(name: []const u8, attrs: anytype) Span {
     if (global_instance) |lf| {
         return lf.createSpan(name, attrs);
     }
-    return .{ .inner = null };
+    return .{ .inner = null, .parent_context = null };
 }
 
 /// log at trace level
