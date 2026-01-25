@@ -77,6 +77,8 @@ Without a token, output goes to console for local development.
 ## Features
 
 - **Spans** - timing and tracing with attributes, automatic parent-child linking
+- **Instrumentation helpers** - `httpSpan()` and `sqlSpan()` for common patterns
+- **Async batched export** - BatchSpanProcessor exports every 500ms (matches Python/Rust)
 - **Logging** - trace, debug, info, warn, err (console output)
 - **OTLP Export** - HTTP/protobuf via otel-zig to Logfire or any OTLP-compatible backend
 - **Zero Config** - reads token and endpoint from environment
@@ -101,6 +103,18 @@ defer span.end();
 
 // add attributes after creation
 span.setAttribute("result_count", @as(i64, 42));
+
+// record errors (sets error status + adds exception event)
+span.recordError(error.ConnectionFailed);
+
+// instrumentation helpers for common patterns
+const http_span = logfire.httpSpan("GET", "/api/users", .{});
+defer http_span.end();
+// creates span named "HTTP GET /api/users" with http.request.method and url.path attrs
+
+const db_span = logfire.sqlSpan("SELECT * FROM users WHERE id = ?", "postgresql");
+defer db_span.end();
+// creates span with truncated SQL name and db.system attribute
 
 // logging (console output only for now)
 logfire.trace("detailed trace", .{});
@@ -139,8 +153,11 @@ This is an unofficial community SDK aiming for parity with [logfire-rust](https:
 
 - [x] Spans with attributes
 - [x] Parent-child span linking (thread-local context)
+- [x] Error recording (`span.recordError()`)
 - [x] OTLP HTTP/protobuf export
+- [x] Async batched export (500ms interval, matches Python/Rust)
 - [x] Environment-based configuration
+- [x] Instrumentation helpers (`httpSpan`, `sqlSpan`)
 - [x] Cross-platform (macOS + Linux)
 - [ ] Structured logging export (console only, OTLP TODO)
 - [ ] Metrics (API stubs, implementation TODO)
