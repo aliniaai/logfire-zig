@@ -112,11 +112,13 @@ pub const Logfire = struct {
                 otel_api.trace.Sampler{ .keep = {} },
             );
 
-            // add OTLP exporter pipeline
-            try provider_ptr.addProcessor(
+            // add OTLP exporter pipeline using pipelineBuilder pattern
+            var builder = provider_ptr.pipelineBuilder();
+            builder = builder.with(
                 otel_sdk.trace.BasicSpanProcessor.PipelineStep.init({})
                     .flowTo(otel_exporters.otlp.OtlpTraceExporter.PipelineStep.init(otlp_config)),
             );
+            try builder.done();
 
             // set as global provider
             otel_api.provider_registry.setGlobalTracerProvider(provider_ptr);
