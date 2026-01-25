@@ -144,7 +144,7 @@ try lf.flush();
 
 ```bash
 zig build test       # run tests
-zig build example    # run examples/basic.zig
+zig build example    # run example
 ```
 
 ## Status
