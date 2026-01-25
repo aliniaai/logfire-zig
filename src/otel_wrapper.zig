@@ -120,8 +120,8 @@ pub const Logfire = struct {
             );
             try builder.done();
 
-            // set as global provider
-            otel_api.provider_registry.setGlobalTracerProvider(provider_ptr);
+            // set as global provider (use tracerProvider() to get interface wrapper)
+            try otel_api.provider_registry.setGlobalTracerProvider(provider_ptr.tracerProvider());
             self.trace_provider = provider_ptr;
 
             // get tracer
