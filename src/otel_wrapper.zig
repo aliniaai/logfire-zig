@@ -378,6 +378,56 @@ pub fn gaugeDouble(name: []const u8, value: f64) void {
 }
 
 // ============================================================================
+// instrumentation helpers (HTTP, SQL)
+// ============================================================================
+
+/// create an HTTP span with formatted name: "HTTP {method} {path}"
+/// adds standard http.request.method and url.path attributes
+pub fn httpSpan(method: []const u8, path: []const u8, attrs: anytype) Span {
+    var name_buf: [256]u8 = undefined;
+    const span_name = std.fmt.bufPrint(&name_buf, "HTTP {s} {s}", .{ method, path }) catch "HTTP request";
+
+    // merge standard HTTP attrs with user attrs
+    const T = @TypeOf(attrs);
+    if (@typeInfo(T) == .@"struct" and @typeInfo(T).@"struct".fields.len > 0) {
+        // user provided extra attrs - for now just use standard ones
+        // TODO: merge attrs properly
+        return span(span_name, .{
+            .@"http.request.method" = method,
+            .@"url.path" = path,
+        });
+    } else {
+        return span(span_name, .{
+            .@"http.request.method" = method,
+            .@"url.path" = path,
+        });
+    }
+}
+
+/// create a SQL span with truncated query as name
+/// adds db.system attribute
+pub fn sqlSpan(sql: []const u8, db_system: []const u8) Span {
+    var name_buf: [128]u8 = undefined;
+    const span_name = truncateSql(&name_buf, sql);
+    return span(span_name, .{ .@"db.system" = db_system });
+}
+
+/// truncate SQL for display (max 60 chars, break at word boundary)
+fn truncateSql(buf: []u8, sql: []const u8) []const u8 {
+    const max_len: usize = 60;
+    if (sql.len <= max_len) {
+        return std.fmt.bufPrint(buf, "{s}", .{sql}) catch sql[0..@min(sql.len, buf.len)];
+    }
+
+    // find a good break point (space)
+    var end: usize = max_len;
+    while (end > 40 and sql[end] != ' ') : (end -= 1) {}
+    if (end <= 40) end = max_len;
+
+    return std.fmt.bufPrint(buf, "{s}...", .{sql[0..end]}) catch sql[0..@min(sql.len, buf.len)];
+}
+
+// ============================================================================
 // helpers
 // ============================================================================
 
