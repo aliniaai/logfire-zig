@@ -1,59 +1,62 @@
 //! otel-based logfire example
 //!
 //! demonstrates the new otel-zig backed API.
+//! API matches current leaflet-search usage patterns.
 //!
 //! run with:
 //!   LOGFIRE_TOKEN=your_token zig build otel-example
 //!
-//! or without token for no-op behavior:
+//! or without token for console-only output:
 //!   zig build otel-example
 
 const std = @import("std");
 const logfire = @import("logfire-otel");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    // configure with otel-zig backend
-    const lf = try logfire.OtelLogfire.init(allocator, .{
+    // configure logfire (reads LOGFIRE_TOKEN from env)
+    // API matches: logfire.configure({...})
+    _ = logfire.configure(.{
         .service_name = "logfire-zig-otel-example",
         .service_version = "0.1.0",
         .environment = "development",
-    });
-    defer lf.shutdown();
+    }) catch |err| {
+        std.debug.print("logfire init failed: {}, continuing\n", .{err});
+    };
 
-    std.debug.print("logfire initialized (otel backend)\n", .{});
+    // logging - matches: logfire.info("msg", .{args})
+    logfire.info("application started", .{});
 
-    // create a span
+    // span with attributes - matches: logfire.span("name", .{attrs})
+    // uses const span pattern for API compatibility with leaflet-search
     {
-        var s = lf.span("example.work");
-        defer s.end();
-
-        // add attributes
-        s.setAttribute("iteration", @as(i64, 1));
-        s.setAttribute("query", "prefect python");
+        const span = logfire.span("example.work", .{
+            .iteration = @as(i64, 1),
+            .query = "prefect python",
+        });
+        defer span.end();
 
         // simulate work
         std.posix.nanosleep(0, 50 * std.time.ns_per_ms);
+
+        logfire.info("work completed", .{});
     }
 
     // nested spans
     {
-        var outer = lf.span("example.outer");
+        const outer = logfire.span("example.outer", .{});
         defer outer.end();
 
         {
-            var inner = lf.span("example.inner");
+            const inner = logfire.span("example.inner", .{});
             defer inner.end();
 
             std.posix.nanosleep(0, 25 * std.time.ns_per_ms);
         }
     }
 
-    // flush to ensure export
-    try lf.flush();
+    // metrics (stubs for now)
+    logfire.counter("requests.total", 1);
+    logfire.gaugeInt("connections.active", 42);
 
-    std.debug.print("example complete - check logfire dashboard\n", .{});
+    logfire.info("example complete", .{});
 }

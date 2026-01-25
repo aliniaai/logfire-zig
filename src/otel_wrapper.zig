@@ -1,7 +1,19 @@
-//! otel-zig wrapper for logfire
+//! logfire-zig: otel-backed observability SDK for Logfire
 //!
-//! provides a simple, logfire-specific wrapper around otel-zig.
-//! this is phase 3 of the otel-zig adoption plan.
+//! API modeled after Rust and Python Logfire SDKs.
+//!
+//! usage:
+//!   const lf = try logfire.configure(.{
+//!       .service_name = "my-service",
+//!   });
+//!   defer lf.shutdown();
+//!
+//!   logfire.info("server started on port {d}", .{port});
+//!
+//!   const span = logfire.span("http.request", .{ .method = "GET" });
+//!   defer span.end();
+//!
+//!   logfire.counter("requests.total", 1);
 
 const std = @import("std");
 const otel = @import("otel");
@@ -9,40 +21,41 @@ const otel_api = otel.api;
 const otel_sdk = otel.sdk;
 const otel_exporters = otel.exporters;
 
-const Config = @import("config.zig").Config;
+const Config = @import("config").Config;
 
-/// logfire wrapper around otel-zig providers
-pub const OtelLogfire = struct {
+// ============================================================================
+// global state (similar to Python's DEFAULT_LOGFIRE_INSTANCE)
+// ============================================================================
+
+var global_instance: ?*Logfire = null;
+var global_allocator: ?std.mem.Allocator = null;
+
+// ============================================================================
+// Logfire - main SDK type
+// ============================================================================
+
+pub const Logfire = struct {
     allocator: std.mem.Allocator,
     config: Config,
 
-    // providers (owned)
+    // otel providers
     trace_provider: ?*otel_sdk.trace.TracerProvider = null,
     log_provider: ?*otel_sdk.logs.LoggerProvider = null,
-    // metric_provider: ?*otel_sdk.metrics.MeterProvider = null,
 
     // cached instruments
     tracer: ?otel_api.trace.Tracer = null,
     logger: ?otel_api.logs.Logger = null,
 
-    // heap-allocated auth header (must outlive exporter)
+    // heap-allocated data that must outlive providers
     auth_header_value: ?[]u8 = null,
     headers: ?[]std.http.Header = null,
 
     const Self = @This();
 
+    /// configure and return a Logfire instance
+    /// also sets the global instance for convenience functions
     pub fn init(allocator: std.mem.Allocator, config: Config) !*Self {
         const resolved = config.resolve();
-
-        if (!resolved.shouldSend()) {
-            // return no-op instance
-            const self = try allocator.create(Self);
-            self.* = .{
-                .allocator = allocator,
-                .config = resolved,
-            };
-            return self;
-        }
 
         const self = try allocator.create(Self);
         errdefer allocator.destroy(self);
@@ -52,15 +65,23 @@ pub const OtelLogfire = struct {
             .config = resolved,
         };
 
-        // set up trace provider with OTLP exporter
+        // set global state
+        global_instance = self;
+        global_allocator = allocator;
+
+        // if not sending, return no-op instance
+        if (!resolved.shouldSend()) {
+            return self;
+        }
+
+        // set up OTLP exporter with Logfire endpoint
         if (resolved.token) |token| {
             const endpoint = getEndpointFromToken(token);
 
-            // heap-allocate auth header value (must outlive exporter)
+            // heap-allocate auth header (must outlive exporter)
             self.auth_header_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
             errdefer if (self.auth_header_value) |v| allocator.free(v);
 
-            // heap-allocate headers array
             self.headers = try allocator.alloc(std.http.Header, 1);
             errdefer if (self.headers) |h| allocator.free(h);
 
@@ -93,30 +114,51 @@ pub const OtelLogfire = struct {
         return self;
     }
 
-    pub fn deinit(self: *Self) void {
+    /// shutdown and cleanup all resources
+    pub fn shutdown(self: *Self) void {
         if (self.trace_provider) |p| {
+            _ = p.shutdown(null);
             p.deinit();
             p.destroy();
         }
         if (self.log_provider) |p| {
+            _ = p.shutdown(null);
             p.deinit();
             p.destroy();
         }
         otel_api.provider_registry.unsetAllProviders();
 
-        // free heap-allocated header data
+        // free heap-allocated data
         if (self.headers) |h| self.allocator.free(h);
         if (self.auth_header_value) |v| self.allocator.free(v);
+
+        // clear global state
+        if (global_instance == self) {
+            global_instance = null;
+        }
 
         self.allocator.destroy(self);
     }
 
+    /// force flush pending telemetry
+    pub fn flush(self: *Self) !void {
+        if (self.trace_provider) |p| {
+            _ = p.forceFlush(null);
+        }
+    }
+
+    // ========================================================================
+    // spans
+    // ========================================================================
+
     /// create a span with the given name and attributes
-    pub fn span(self: *Self, name: []const u8) Span {
+    pub fn createSpan(self: *Self, name: []const u8, attrs: anytype) Span {
         if (self.tracer) |*tracer| {
+            const otel_attrs = attrsToOtel(attrs);
             const ctx = &[_]otel_api.ContextKeyValue{};
             const span_result = tracer.startSpan(name, .{
                 .kind = .internal,
+                .attributes = otel_attrs,
             }, ctx) catch {
                 return .{ .inner = null };
             };
@@ -125,67 +167,127 @@ pub const OtelLogfire = struct {
         return .{ .inner = null };
     }
 
-    /// flush any pending data
-    pub fn flush(self: *Self) !void {
-        if (self.trace_provider) |p| {
-            _ = p.forceFlush(null);
-        }
-    }
+    // ========================================================================
+    // logging
+    // ========================================================================
 
-    /// shutdown the provider
-    pub fn shutdown(self: *Self) void {
-        if (self.trace_provider) |p| {
-            _ = p.shutdown(null);
+    pub fn logMessage(self: *Self, comptime level: Config.Level, comptime fmt: []const u8, args: anytype) void {
+        // console output if enabled
+        if (self.config.console) |console| {
+            if (console.enabled and @intFromEnum(level) >= @intFromEnum(console.min_level)) {
+                std.debug.print("[{s}] ", .{level.name()});
+                std.debug.print(fmt ++ "\n", args);
+            }
         }
-        self.deinit();
+
+        // TODO: emit to otel logger when log provider is set up
     }
 };
 
-/// span wrapper for ergonomic usage
+// ============================================================================
+// Span wrapper
+// ============================================================================
+
 pub const Span = struct {
     inner: ?otel_api.trace.Span,
 
-    pub fn end(self: *Span) void {
-        if (self.inner) |*s| {
-            s.end(null);
-            s.deinit();
-            self.inner = null;
+    /// end the span - takes *const for API compatibility with legacy logfire
+    pub fn end(self: *const Span) void {
+        if (self.inner != null) {
+            // use @constCast for API compatibility (allows const span = ... pattern)
+            const mutable = @constCast(self);
+            if (mutable.inner) |*s| {
+                s.end(null);
+                s.deinit();
+                mutable.inner = null;
+            }
         }
     }
 
-    pub fn setAttribute(self: *Span, key: []const u8, value: anytype) void {
-        if (self.inner) |*s| {
-            const attr_value = toAttributeValue(value);
-            s.setAttribute(.{ .key = key, .value = attr_value });
+    pub fn setAttribute(self: *const Span, key: []const u8, value: anytype) void {
+        if (self.inner != null) {
+            const mutable = @constCast(self);
+            if (mutable.inner) |*s| {
+                s.setAttribute(.{ .key = key, .value = toOtelValue(value) });
+            }
         }
     }
 };
 
-fn toAttributeValue(value: anytype) otel_api.common.AttributeValue {
-    const T = @TypeOf(value);
-    return switch (@typeInfo(T)) {
-        .int, .comptime_int => .{ .int = @intCast(value) },
-        .float, .comptime_float => .{ .double = @floatCast(value) },
-        .bool => .{ .bool = value },
-        .pointer => |ptr| {
-            // handle []const u8 (slices)
-            if (ptr.size == .slice and ptr.child == u8) {
-                return .{ .string = value };
-            }
-            // handle *const [N]u8 and *const [N:0]u8 (string literals)
-            if (ptr.size == .one) {
-                const child_info = @typeInfo(ptr.child);
-                if (child_info == .array and child_info.array.child == u8) {
-                    return .{ .string = value };
-                }
-            }
-            @compileError("unsupported pointer type for attribute");
-        },
-        else => @compileError("unsupported type for attribute: " ++ @typeName(T)),
-    };
+// ============================================================================
+// convenience functions (use global instance)
+// ============================================================================
+
+/// configure logfire with the given options
+/// returns the configured instance
+pub fn configure(config: Config) !*Logfire {
+    const allocator = std.heap.page_allocator;
+    return Logfire.init(allocator, config);
 }
 
-/// extract region from logfire token and return base OTLP endpoint
+/// create a span (uses global instance)
+pub fn span(name: []const u8, attrs: anytype) Span {
+    if (global_instance) |lf| {
+        return lf.createSpan(name, attrs);
+    }
+    return .{ .inner = null };
+}
+
+/// log at trace level
+pub fn trace(comptime fmt: []const u8, args: anytype) void {
+    if (global_instance) |lf| lf.logMessage(.trace, fmt, args);
+}
+
+/// log at debug level
+pub fn debug(comptime fmt: []const u8, args: anytype) void {
+    if (global_instance) |lf| lf.logMessage(.debug, fmt, args);
+}
+
+/// log at info level
+pub fn info(comptime fmt: []const u8, args: anytype) void {
+    if (global_instance) |lf| lf.logMessage(.info, fmt, args);
+}
+
+/// log at warn level
+pub fn warn(comptime fmt: []const u8, args: anytype) void {
+    if (global_instance) |lf| lf.logMessage(.warn, fmt, args);
+}
+
+/// log at error level
+pub fn err(comptime fmt: []const u8, args: anytype) void {
+    if (global_instance) |lf| lf.logMessage(.err, fmt, args);
+}
+
+// ============================================================================
+// metrics (stubs for now - TODO: implement with otel metrics)
+// ============================================================================
+
+pub fn counter(name: []const u8, value: i64) void {
+    _ = name;
+    _ = value;
+    // TODO: implement with otel-zig metrics
+}
+
+pub fn counterWithOpts(name: []const u8, value: i64, opts: anytype) void {
+    _ = name;
+    _ = value;
+    _ = opts;
+}
+
+pub fn gaugeInt(name: []const u8, value: i64) void {
+    _ = name;
+    _ = value;
+}
+
+pub fn gaugeDouble(name: []const u8, value: f64) void {
+    _ = name;
+    _ = value;
+}
+
+// ============================================================================
+// helpers
+// ============================================================================
+
 fn getEndpointFromToken(token: []const u8) []const u8 {
     if (std.mem.startsWith(u8, token, "pylf_v")) {
         var it = std.mem.splitScalar(u8, token, '_');
@@ -200,8 +302,50 @@ fn getEndpointFromToken(token: []const u8) []const u8 {
     return "https://logfire-us.pydantic.dev:443";
 }
 
-// convenience function to create and configure
-pub fn configure(config: Config) !*OtelLogfire {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    return OtelLogfire.init(gpa.allocator(), config);
+fn toOtelValue(value: anytype) otel_api.common.AttributeValue {
+    const T = @TypeOf(value);
+    return switch (@typeInfo(T)) {
+        .int, .comptime_int => .{ .int = @intCast(value) },
+        .float, .comptime_float => .{ .double = @floatCast(value) },
+        .bool => .{ .bool = value },
+        .pointer => |ptr| {
+            if (ptr.size == .slice and ptr.child == u8) {
+                return .{ .string = value };
+            }
+            if (ptr.size == .one) {
+                const child_info = @typeInfo(ptr.child);
+                if (child_info == .array and child_info.array.child == u8) {
+                    return .{ .string = value };
+                }
+            }
+            @compileError("unsupported pointer type");
+        },
+        else => @compileError("unsupported type for attribute: " ++ @typeName(T)),
+    };
+}
+
+fn attrsToOtel(attrs: anytype) []const otel_api.common.AttributeKeyValue {
+    const T = @TypeOf(attrs);
+    if (@typeInfo(T) != .@"struct") {
+        return &[_]otel_api.common.AttributeKeyValue{};
+    }
+
+    const fields = @typeInfo(T).@"struct".fields;
+    if (fields.len == 0) {
+        return &[_]otel_api.common.AttributeKeyValue{};
+    }
+
+    // use static storage per type - populated at runtime
+    // note: not thread-safe, but attributes are copied by otel-zig immediately
+    const Storage = struct {
+        var result: [fields.len]otel_api.common.AttributeKeyValue = undefined;
+    };
+
+    inline for (fields, 0..) |field, i| {
+        Storage.result[i] = .{
+            .key = field.name,
+            .value = toOtelValue(@field(attrs, field.name)),
+        };
+    }
+    return &Storage.result;
 }
