@@ -124,7 +124,7 @@ pub const Logfire = struct {
             var builder = provider_ptr.pipelineBuilder();
             builder = builder.with(
                 otel_sdk.trace.BatchSpanProcessor.PipelineStep.init(.{
-                    .export_interval_ms = 1000, // export every 1s
+                    .export_interval_ms = 500, // 500ms matches Python/Rust logfire
                     .max_queue_size = 2048,
                 }).flowTo(otel_exporters.otlp.OtlpTraceExporter.PipelineStep.init(otlp_config)),
             );
