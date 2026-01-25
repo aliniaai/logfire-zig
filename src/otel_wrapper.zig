@@ -96,12 +96,31 @@ pub const Logfire = struct {
                 .headers = self.headers.?,
             };
 
-            // set up trace provider
-            self.trace_provider = try otel_sdk.trace.setupGlobalProvider(
+            // create trace provider manually to avoid OS-specific resource detection
+            // (otel-zig's setupGlobalProvider uses detectResource which only supports macOS)
+            const provider_ptr = try allocator.create(otel_sdk.trace.TracerProvider);
+            errdefer allocator.destroy(provider_ptr);
+
+            // create minimal resource with service name
+            const resource = try createMinimalResource(allocator, resolved.service_name orelse "logfire-zig");
+            errdefer resource.deinitOwned(allocator);
+
+            provider_ptr.* = otel_sdk.trace.TracerProvider.init(
                 allocator,
-                .{otel_sdk.trace.BasicSpanProcessor.PipelineStep.init({})
-                    .flowTo(otel_exporters.otlp.OtlpTraceExporter.PipelineStep.init(otlp_config))},
+                resource,
+                otel_sdk.trace.createDefaultIdGenerator(),
+                otel_api.trace.Sampler{ .keep = {} },
             );
+
+            // add OTLP exporter pipeline
+            try provider_ptr.addProcessor(
+                otel_sdk.trace.BasicSpanProcessor.PipelineStep.init({})
+                    .flowTo(otel_exporters.otlp.OtlpTraceExporter.PipelineStep.init(otlp_config)),
+            );
+
+            // set as global provider
+            otel_api.provider_registry.setGlobalTracerProvider(provider_ptr);
+            self.trace_provider = provider_ptr;
 
             // get tracer
             const scope = otel_api.InstrumentationScope{
@@ -287,6 +306,57 @@ pub fn gaugeDouble(name: []const u8, value: f64) void {
 // ============================================================================
 // helpers
 // ============================================================================
+
+/// create a minimal resource without OS-specific detection
+/// this avoids otel-zig's ProcessDetector which only supports macOS
+fn createMinimalResource(allocator: std.mem.Allocator, service_name: []const u8) !otel_sdk.resource.Resource {
+    const builtin = @import("builtin");
+
+    // build attributes
+    var attrs = otel_api.common.AttributeBuilder.init(allocator);
+
+    // telemetry SDK info
+    attrs = attrs.add(.{ .key = "telemetry.sdk.name", .value = .{ .string = "logfire-zig" } });
+    attrs = attrs.add(.{ .key = "telemetry.sdk.language", .value = .{ .string = "zig" } });
+    attrs = attrs.add(.{ .key = "telemetry.sdk.version", .value = .{ .string = "0.1.0" } });
+
+    // service name
+    attrs = attrs.add(.{ .key = "service.name", .value = .{ .string = service_name } });
+
+    // process.pid (works on all POSIX systems)
+    const pid = std.c.getpid();
+    attrs = attrs.add(.{ .key = "process.pid", .value = .{ .int = @intCast(pid) } });
+
+    // process.executable.name via /proc/self/exe (Linux) or _NSGetExecutablePath (macOS)
+    switch (builtin.os.tag) {
+        .linux => {
+            // read /proc/self/exe symlink
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            if (std.fs.readLinkAbsolute("/proc/self/exe", &buf)) |path| {
+                const basename = std.fs.path.basename(path);
+                const owned_path = try allocator.dupe(u8, path);
+                const owned_basename = try allocator.dupe(u8, basename);
+                attrs = attrs.add(.{ .key = "process.executable.path", .value = .{ .string = owned_path } });
+                attrs = attrs.add(.{ .key = "process.executable.name", .value = .{ .string = owned_basename } });
+            } else |_| {}
+        },
+        .macos => {
+            var size: u32 = std.fs.max_path_bytes;
+            var buf: [std.fs.max_path_bytes:0]u8 = undefined;
+            if (std.c._NSGetExecutablePath(&buf, &size) == 0) {
+                const path = std.mem.sliceTo(&buf, 0);
+                const basename = std.fs.path.basename(path);
+                const owned_path = try allocator.dupe(u8, path);
+                const owned_basename = try allocator.dupe(u8, basename);
+                attrs = attrs.add(.{ .key = "process.executable.path", .value = .{ .string = owned_path } });
+                attrs = attrs.add(.{ .key = "process.executable.name", .value = .{ .string = owned_basename } });
+            }
+        },
+        else => {}, // skip executable info on other OSes
+    }
+
+    return try otel_sdk.resource.Resource.initOwnedFromBuilder(allocator, null, &attrs);
+}
 
 fn getEndpointFromToken(token: []const u8) []const u8 {
     if (std.mem.startsWith(u8, token, "pylf_v")) {
