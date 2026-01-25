@@ -302,12 +302,19 @@ fn getEndpointFromToken(token: []const u8) []const u8 {
     return "https://logfire-us.pydantic.dev:443";
 }
 
-fn toOtelValue(value: anytype) otel_api.common.AttributeValue {
+fn toOtelValue(value: anytype) ?otel_api.common.AttributeValue {
     const T = @TypeOf(value);
     return switch (@typeInfo(T)) {
         .int, .comptime_int => .{ .int = @intCast(value) },
         .float, .comptime_float => .{ .double = @floatCast(value) },
         .bool => .{ .bool = value },
+        .optional => {
+            // handle optional types - return null if the value is null
+            if (value) |v| {
+                return toOtelValue(v);
+            }
+            return null;
+        },
         .pointer => |ptr| {
             if (ptr.size == .slice and ptr.child == u8) {
                 return .{ .string = value };
@@ -339,13 +346,18 @@ fn attrsToOtel(attrs: anytype) []const otel_api.common.AttributeKeyValue {
     // note: not thread-safe, but attributes are copied by otel-zig immediately
     const Storage = struct {
         var result: [fields.len]otel_api.common.AttributeKeyValue = undefined;
+        var count: usize = 0;
     };
 
-    inline for (fields, 0..) |field, i| {
-        Storage.result[i] = .{
-            .key = field.name,
-            .value = toOtelValue(@field(attrs, field.name)),
-        };
+    Storage.count = 0;
+    inline for (fields) |field| {
+        if (toOtelValue(@field(attrs, field.name))) |val| {
+            Storage.result[Storage.count] = .{
+                .key = field.name,
+                .value = val,
+            };
+            Storage.count += 1;
+        }
     }
-    return &Storage.result;
+    return Storage.result[0..Storage.count];
 }
