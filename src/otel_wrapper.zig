@@ -233,6 +233,16 @@ pub const Logfire = struct {
 // Span wrapper
 // ============================================================================
 
+/// span status codes (per otel semantic conventions)
+pub const StatusCode = enum {
+    /// default - status not explicitly set
+    unset,
+    /// operation completed successfully
+    ok,
+    /// operation failed
+    @"error",
+};
+
 pub const Span = struct {
     inner: ?otel_api.trace.Span,
     parent_context: ?otel_api.trace.Span.Context,
@@ -260,6 +270,38 @@ pub const Span = struct {
                 if (toOtelValue(value)) |val| {
                     s.setAttribute(.{ .key = key, .value = val });
                 }
+            }
+        }
+    }
+
+    /// set span status (call with .@"error" to mark failures)
+    pub fn setStatus(self: *const Span, code: StatusCode, description: ?[]const u8) void {
+        if (self.inner != null) {
+            const mutable = @constCast(self);
+            if (mutable.inner) |*s| {
+                s.setStatus(.{
+                    .code = switch (code) {
+                        .unset => .unset,
+                        .ok => .ok,
+                        .@"error" => .@"error",
+                    },
+                    .description = description,
+                });
+            }
+        }
+    }
+
+    /// record an error on the span (adds event + sets error status)
+    pub fn recordError(self: *const Span, e: anyerror) void {
+        if (self.inner != null) {
+            const mutable = @constCast(self);
+            if (mutable.inner) |*s| {
+                // otel API calls this "exception" but we use zig-idiomatic naming
+                s.recordException(e, null, null) catch {};
+                s.setStatus(.{
+                    .code = .@"error",
+                    .description = @errorName(e),
+                });
             }
         }
     }
