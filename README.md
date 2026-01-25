@@ -1,6 +1,6 @@
 # logfire-zig
 
-unofficial Zig SDK for [Pydantic Logfire](https://logfire.pydantic.dev/) - OTLP HTTP/JSON export for traces, logs, and metrics.
+unofficial Zig SDK for [Pydantic Logfire](https://logfire.pydantic.dev/) - built on [otel-zig](https://github.com/open-telemetry/opentelemetry-zig) for OTLP/protobuf export.
 
 aiming for parity with [logfire-rust](https://github.com/pydantic/logfire-rust).
 
@@ -45,21 +45,21 @@ pub fn main() !void {
     });
     defer lf.shutdown();
 
-    // structured logging
+    // structured logging (console output)
     logfire.info("application started", .{});
 
-    // spans for timing operations
+    // spans for timing operations (exported to Logfire)
     {
         const span = logfire.span("process.files", .{});
         defer span.end();
 
-        // work happens here
-        std.time.sleep(10 * std.time.ns_per_ms);
+        // nested spans automatically link to parent
+        {
+            const child = logfire.span("process.single_file", .{ .filename = "data.csv" });
+            defer child.end();
+            std.time.sleep(10 * std.time.ns_per_ms);
+        }
     }
-
-    // metrics
-    logfire.counter("files.processed", 42);
-    logfire.gaugeInt("queue.depth", 10);
 
     // flush before exit
     try lf.flush();
@@ -76,11 +76,11 @@ Without a token, output goes to console for local development.
 
 ## Features
 
-- **Spans** - timing and tracing with attributes
-- **Logging** - trace, debug, info, warn, err with structured data
-- **Metrics** - counters, gauges (int/double)
-- **OTLP Export** - HTTP/JSON to logfire or any OTLP-compatible backend
+- **Spans** - timing and tracing with attributes, automatic parent-child linking
+- **Logging** - trace, debug, info, warn, err (console output)
+- **OTLP Export** - HTTP/protobuf via otel-zig to Logfire or any OTLP-compatible backend
 - **Zero Config** - reads token and endpoint from environment
+- **Cross-platform** - works on macOS and Linux
 
 ## API
 
@@ -89,28 +89,25 @@ Without a token, output goes to console for local development.
 const lf = try logfire.configure(.{
     .service_name = "my-service",
     .service_version = "1.0.0",
-    .environment = "production",
 });
 defer lf.shutdown();
 
-// spans
+// spans (exported to Logfire via OTLP/protobuf)
 const span = logfire.span("operation.name", .{
     .user_id = @as(i64, 123),
     .request_path = "/api/search",
 });
 defer span.end();
 
-// logging
+// add attributes after creation
+span.setAttribute("result_count", @as(i64, 42));
+
+// logging (console output only for now)
 logfire.trace("detailed trace", .{});
 logfire.debug("debug info", .{});
 logfire.info("something happened", .{});
 logfire.warn("warning message", .{});
 logfire.err("error occurred", .{});
-
-// metrics
-logfire.counter("requests.total", 1);
-logfire.gaugeInt("connections.active", 42);
-logfire.gaugeDouble("cpu.usage", 0.75);
 
 // manual flush
 try lf.flush();
@@ -138,17 +135,15 @@ zig build example    # run examples/basic.zig
 
 ## Status
 
-This is an unofficial community SDK aiming for parity with [logfire-rust](https://github.com/pydantic/logfire-rust). Current status:
+This is an unofficial community SDK aiming for parity with [logfire-rust](https://github.com/pydantic/logfire-rust). Built on [otel-zig](https://github.com/open-telemetry/opentelemetry-zig).
 
 - [x] Spans with attributes
-- [x] Structured logging (trace/debug/info/warn/err)
-- [x] Metrics (counter, gauge)
-- [x] OTLP HTTP/JSON export
+- [x] Parent-child span linking (thread-local context)
+- [x] OTLP HTTP/protobuf export
 - [x] Environment-based configuration
-- [x] Batched async export (background flush thread)
-- [x] Parent-child span linking (thread-local)
-- [ ] Histograms (types implemented, no convenience API yet)
-- [ ] Protobuf encoding (JSON only)
+- [x] Cross-platform (macOS + Linux)
+- [ ] Structured logging export (console only, OTLP TODO)
+- [ ] Metrics (API stubs, implementation TODO)
 - [ ] W3C trace context propagation (cross-service)
 
 ## License
