@@ -119,11 +119,14 @@ pub const Logfire = struct {
                 otel_api.trace.Sampler{ .keep = {} },
             );
 
-            // add OTLP exporter pipeline using pipelineBuilder pattern
+            // add OTLP exporter pipeline using BatchSpanProcessor for async export
+            // (BasicSpanProcessor exports synchronously on every span.end(), causing latency)
             var builder = provider_ptr.pipelineBuilder();
             builder = builder.with(
-                otel_sdk.trace.BasicSpanProcessor.PipelineStep.init({})
-                    .flowTo(otel_exporters.otlp.OtlpTraceExporter.PipelineStep.init(otlp_config)),
+                otel_sdk.trace.BatchSpanProcessor.PipelineStep.init(.{
+                    .export_interval_ms = 1000, // export every 1s
+                    .max_queue_size = 2048,
+                }).flowTo(otel_exporters.otlp.OtlpTraceExporter.PipelineStep.init(otlp_config)),
             );
             try builder.done();
 
