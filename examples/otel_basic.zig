@@ -1,16 +1,16 @@
-//! otel-based logfire example
+//! logfire example
 //!
-//! demonstrates the new otel-zig backed API.
+//! demonstrates the otel-zig backed API.
 //! API matches current leaflet-search usage patterns.
 //!
 //! run with:
-//!   LOGFIRE_TOKEN=your_token zig build otel-example
+//!   LOGFIRE_TOKEN=your_token zig build example
 //!
 //! or without token for console-only output:
-//!   zig build otel-example
+//!   zig build example
 
 const std = @import("std");
-const logfire = @import("logfire-otel");
+const logfire = @import("logfire");
 
 pub fn main() !void {
     // configure logfire (reads LOGFIRE_TOKEN from env)
