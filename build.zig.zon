@@ -10,7 +10,7 @@
     },
     .dependencies = .{
         .opentelemetry = .{
-            .url = "https://github.com/ibd1279/otel-zig/archive/refs/heads/trunk.tar.gz",
+            .url = "https://github.com/zzstoatzz/otel-zig/archive/refs/heads/trunk.tar.gz",
             .hash = "otel-0.0.1-9q9ZWhF9EwACdQz1-ETtOK8585KTaWSFqmGgbfxW4l7c",
         },
     },
