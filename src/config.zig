@@ -5,6 +5,11 @@
 
 const std = @import("std");
 
+fn cGetenv(name: [*:0]const u8) ?[]const u8 {
+    if (std.c.getenv(name)) |p| return std.mem.span(p);
+    return null;
+}
+
 pub const Config = struct {
     /// service name (required for logfire)
     /// env: LOGFIRE_SERVICE_NAME, OTEL_SERVICE_NAME
@@ -81,30 +86,30 @@ pub const Config = struct {
 
         // token
         if (resolved.token == null) {
-            resolved.token = std.posix.getenv("LOGFIRE_WRITE_TOKEN") orelse
-                std.posix.getenv("LOGFIRE_TOKEN");
+            resolved.token = cGetenv("LOGFIRE_WRITE_TOKEN") orelse
+                cGetenv("LOGFIRE_TOKEN");
         }
 
         // service name
         if (resolved.service_name == null) {
-            resolved.service_name = std.posix.getenv("LOGFIRE_SERVICE_NAME") orelse
-                std.posix.getenv("OTEL_SERVICE_NAME");
+            resolved.service_name = cGetenv("LOGFIRE_SERVICE_NAME") orelse
+                cGetenv("OTEL_SERVICE_NAME");
         }
 
         // service version
         if (resolved.service_version == null) {
-            resolved.service_version = std.posix.getenv("LOGFIRE_SERVICE_VERSION") orelse
-                std.posix.getenv("OTEL_SERVICE_VERSION");
+            resolved.service_version = cGetenv("LOGFIRE_SERVICE_VERSION") orelse
+                cGetenv("OTEL_SERVICE_VERSION");
         }
 
         // environment
         if (resolved.environment == null) {
-            resolved.environment = std.posix.getenv("LOGFIRE_ENVIRONMENT");
+            resolved.environment = cGetenv("LOGFIRE_ENVIRONMENT");
         }
 
         // base URL - derive from token region if not explicit
         if (resolved.base_url == null) {
-            if (std.posix.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")) |endpoint| {
+            if (cGetenv("OTEL_EXPORTER_OTLP_ENDPOINT")) |endpoint| {
                 resolved.base_url = endpoint;
             } else if (resolved.token) |token| {
                 resolved.base_url = getBaseUrlFromToken(token);

@@ -8,19 +8,20 @@
 //! this validates phase 1 of the otel-zig adoption plan.
 
 const std = @import("std");
+const test_io = std.Options.debug_io;
 const otel = @import("otel");
 const otel_api = otel.api;
 const otel_sdk = otel.sdk;
 const otel_exporters = otel.exporters;
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     // get logfire token and endpoint from env
-    const token = std.posix.getenv("LOGFIRE_WRITE_TOKEN") orelse
-        std.posix.getenv("LOGFIRE_TOKEN") orelse {
+    const token = (if (std.c.getenv("LOGFIRE_WRITE_TOKEN")) |p| std.mem.span(p) else null) orelse
+        (if (std.c.getenv("LOGFIRE_TOKEN")) |p| std.mem.span(p) else null) orelse {
         std.debug.print("LOGFIRE_TOKEN not set, skipping OTLP test\n", .{});
         return;
     };
@@ -75,7 +76,7 @@ pub fn main() !void {
     }, ctx);
 
     // simulate some work
-    std.posix.nanosleep(0, 50 * std.time.ns_per_ms);
+    test_io.sleep(.{ .nanoseconds = 50 * std.time.ns_per_ms }, .real) catch {};
 
     // end span (triggers export)
     span_result.end(null);

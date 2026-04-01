@@ -2,7 +2,7 @@
     .name = .logfire_zig,
     .version = "0.1.0",
     .fingerprint = 0x9bd424192e836cc7,
-    .minimum_zig_version = "0.15.0",
+    .minimum_zig_version = "0.16.0",
     .paths = .{
         "build.zig",
         "build.zig.zon",
@@ -10,8 +10,8 @@
     },
     .dependencies = .{
         .opentelemetry = .{
-            .url = "https://github.com/zzstoatzz/otel-zig/archive/refs/heads/trunk.tar.gz",
-            .hash = "otel-0.0.1-9q9ZWouBEwDUldyFYCJOBowt8fGq950Ri6Q7CbYIFaEp",
+            .url = "https://github.com/zzstoatzz/otel-zig/archive/43dc16434649ebb732daabdd5f4cc3163e6d1b05.tar.gz",
+            .hash = "otel-0.0.1-9q9ZWheIEwBbAlVC5IpFhgSnb4mUxo9D7qzH1unw5Wuj",
         },
     },
 }
