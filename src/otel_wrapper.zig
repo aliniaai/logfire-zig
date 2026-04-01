@@ -16,6 +16,7 @@
 //!   logfire.counter("requests.total", 1);
 
 const std = @import("std");
+const io = std.Options.debug_io;
 const otel = @import("otel");
 const otel_api = otel.api;
 const otel_sdk = otel.sdk;
@@ -459,7 +460,8 @@ fn createMinimalResource(allocator: std.mem.Allocator, service_name: []const u8)
         .linux => {
             // read /proc/self/exe symlink
             var buf: [std.fs.max_path_bytes]u8 = undefined;
-            if (std.fs.readLinkAbsolute("/proc/self/exe", &buf)) |path| {
+            if (std.Io.Dir.readLinkAbsolute(io, "/proc/self/exe", &buf)) |len| {
+                const path = buf[0..len];
                 const basename = std.fs.path.basename(path);
                 const owned_path = try allocator.dupe(u8, path);
                 const owned_basename = try allocator.dupe(u8, basename);
