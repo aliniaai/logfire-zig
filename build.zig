@@ -43,8 +43,24 @@ pub fn build(b: *std.Build) void {
     });
     const run_tests = b.addRunArtifact(tests);
 
+    // config.zig has its own tests but lives in a separate build module, so
+    // a single test target can't surface both its tests and the wrapper's
+    // (zig 0.16: a file can only belong to one module). add a second test
+    // target rooted at config.zig and depend on it from `test` so a single
+    // `zig build test` runs everything.
+    const config_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/config.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const run_config_tests = b.addRunArtifact(config_tests);
+
     const test_step = b.step("test", "run unit tests");
     test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_config_tests.step);
 
     // example executable
     const example = b.addExecutable(.{

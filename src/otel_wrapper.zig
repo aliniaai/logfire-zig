@@ -141,6 +141,45 @@ pub const Logfire = struct {
                 .version = resolved.service_version orelse "0.1.0",
             };
             self.tracer = try otel_api.getGlobalTracerProvider().getTracerWithScope(scope);
+
+            // ----------------------------------------------------------------
+            // log provider setup (mirrors trace provider above)
+            //
+            // identical pipeline shape: BatchLogRecordProcessor → OtlpLogExporter.
+            // a separate Resource is built so each provider owns its memory
+            // (the trace provider's Resource is freed in its own deinit).
+            // ----------------------------------------------------------------
+            const log_provider_ptr = try allocator.create(otel_sdk.logs.LoggerProvider);
+            errdefer allocator.destroy(log_provider_ptr);
+
+            const log_resource = try createMinimalResource(allocator, resolved.service_name orelse "logfire-zig");
+            errdefer log_resource.deinitOwned(allocator);
+
+            log_provider_ptr.* = otel_sdk.logs.LoggerProvider.init(allocator, log_resource);
+
+            var log_builder = log_provider_ptr.pipelineBuilder();
+            log_builder = log_builder.with(
+                otel_sdk.logs.BatchLogRecordProcessor.PipelineStep.init(.{
+                    .export_interval_ms = 500, // match trace cadence
+                    .max_queue_size = 2048,
+                }).flowTo(otel_exporters.otlp.OtlpLogExporter.PipelineStep.init(otlp_config)),
+            );
+            try log_builder.done();
+
+            try otel_api.provider_registry.setGlobalLoggerProvider(log_provider_ptr.loggerProvider());
+            self.log_provider = log_provider_ptr;
+
+            // cache logger for the direct-emit path (logfire.info / .warn / etc.)
+            self.logger = try otel_api.getGlobalLoggerProvider().getLoggerWithScope(scope);
+
+            // initialize the std.log bridge so std.log.* calls (from this app
+            // and from any zig stdlib code) flow into the same OTEL pipeline.
+            // applications opt in by setting:
+            //     pub const std_options: std.Options = .{ .logFn = logfire.logFn };
+            try otel_sdk.std_log_bridge.init(.{
+                .instrumentation_scope_name = resolved.service_name orelse "logfire-zig",
+                .instrumentation_scope_version = resolved.service_version orelse "0.1.0",
+            });
         }
 
         return self;
@@ -148,6 +187,11 @@ pub const Logfire = struct {
 
     /// shutdown and cleanup all resources
     pub fn shutdown(self: *Self) void {
+        // tear down the std.log bridge first so any in-flight std.log.* calls
+        // fall back to std.log.defaultLog rather than dispatching to a logger
+        // whose provider is about to deinit.
+        otel_sdk.std_log_bridge.deinit();
+
         if (self.trace_provider) |p| {
             _ = p.shutdown(null);
             p.deinit();
@@ -172,9 +216,12 @@ pub const Logfire = struct {
         self.allocator.destroy(self);
     }
 
-    /// force flush pending telemetry
+    /// force flush pending telemetry (traces and logs)
     pub fn flush(self: *Self) !void {
         if (self.trace_provider) |p| {
+            _ = p.forceFlush(null);
+        }
+        if (self.log_provider) |p| {
             _ = p.forceFlush(null);
         }
     }
@@ -221,7 +268,8 @@ pub const Logfire = struct {
     // ========================================================================
 
     pub fn logMessage(self: *Self, comptime level: Config.Level, comptime fmt: []const u8, args: anytype) void {
-        // console output if enabled
+        // console output if enabled (kept regardless of OTEL emission so local
+        // dev output still works without a logfire token).
         if (self.config.console) |console| {
             if (console.enabled and @intFromEnum(level) >= @intFromEnum(console.min_level)) {
                 std.debug.print("[{s}] ", .{level.name()});
@@ -229,9 +277,48 @@ pub const Logfire = struct {
             }
         }
 
-        // TODO: emit to otel logger when log provider is set up
+        // emit to otel logger if wired up. fmt + args are formatted into a
+        // stack buffer (truncated past 2KiB to avoid heap allocation in the
+        // hot logging path).
+        if (self.logger) |*logger| {
+            const severity = configLevelToSeverity(level);
+            // mirror std_log_bridge's empty-context call shape — span context
+            // attachment is a future improvement (see notes/observability/
+            // logfire-clients.md).
+            const empty_ctx: []const otel_api.ContextKeyValue = &.{};
+            if (!logger.enabled(empty_ctx, severity)) return;
+
+            var msg_buf: [2048]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, fmt, args) catch
+                msg_buf[0 .. msg_buf.len - 12] ++ " [truncated]";
+
+            logger.emitLogRecord(
+                empty_ctx,
+                severity,
+                .{ .string = msg },
+                null, // attributes
+                @as(i64, @intCast(std.Io.Timestamp.now(io, .real).nanoseconds)),
+                null, // observed_timestamp_ns
+                null, // event_name
+                null, // severity_text
+                null, // trace_id
+                null, // span_id
+                null, // flags
+            );
+        }
     }
 };
+
+/// Map config-level severity values to the otel-zig logs API enum.
+fn configLevelToSeverity(level: Config.Level) otel_api.logs.Severity {
+    return switch (level) {
+        .trace => .trace,
+        .debug => .debug,
+        .info => .info,
+        .warn => .warn,
+        .err => .@"error",
+    };
+}
 
 // ============================================================================
 // Span wrapper
@@ -354,6 +441,28 @@ pub fn warn(comptime fmt: []const u8, args: anytype) void {
 pub fn err(comptime fmt: []const u8, args: anytype) void {
     if (global_instance) |lf| lf.logMessage(.err, fmt, args);
 }
+
+// ============================================================================
+// std.log integration
+// ============================================================================
+
+/// Drop-in for `std.options.logFn`. Routes every `std.log.*` call (from this
+/// app and from any zig stdlib code that uses `std.log`) into the OTEL log
+/// pipeline configured by `Logfire.init`. Falls back to `std.log.defaultLog`
+/// (stderr) until `Logfire.init` runs and brings up the LoggerProvider.
+///
+/// Wire it up once in your application root:
+/// ```zig
+/// const logfire = @import("logfire");
+/// pub const std_options: std.Options = .{
+///     .log_level = .info,
+///     .logFn = logfire.logFn,
+/// };
+/// ```
+///
+/// Implemented by re-exporting `otel-zig`'s `std_log_bridge.otelLogFn`.
+/// `Logfire.init` calls `std_log_bridge.init(...)` which makes this active.
+pub const logFn = otel_sdk.std_log_bridge.otelLogFn;
 
 // ============================================================================
 // metrics (stubs for now - TODO: implement with otel metrics)
@@ -559,4 +668,36 @@ fn attrsToOtel(attrs: anytype) []const otel_api.common.AttributeKeyValue {
         }
     }
     return Storage.result[0..Storage.count];
+}
+
+// ============================================================================
+// tests
+// ============================================================================
+
+// note: config.zig has its own tests but is set up as a separate build
+// module, so it can't be `@import("config.zig")`'d here for test discovery.
+// build.zig has a separate `test-config` target that runs them.
+
+test "configLevelToSeverity maps every Config.Level" {
+    const testing = std.testing;
+    try testing.expectEqual(otel_api.logs.Severity.trace, configLevelToSeverity(.trace));
+    try testing.expectEqual(otel_api.logs.Severity.debug, configLevelToSeverity(.debug));
+    try testing.expectEqual(otel_api.logs.Severity.info, configLevelToSeverity(.info));
+    try testing.expectEqual(otel_api.logs.Severity.warn, configLevelToSeverity(.warn));
+    try testing.expectEqual(otel_api.logs.Severity.@"error", configLevelToSeverity(.err));
+}
+
+test "logFn signature matches std.options.logFn shape" {
+    // Compile-time sanity check: `logFn` must be assignable to a value of
+    // type `@TypeOf(std.log.defaultLog)`. If otel-zig changes the bridge
+    // signature, this fails the build instead of the deploy.
+    const expected_fn_ptr: @TypeOf(std.log.defaultLog) = logFn;
+    _ = expected_fn_ptr;
+}
+
+test "logFn falls back to defaultLog when bridge not initialized" {
+    // logFn must be safe to call before `Logfire.init` runs (and the bridge
+    // gets initialized inside it). otel-zig's bridge handles this with a
+    // fast-path check on its own atomic init flag.
+    logFn(.info, .testing, "boot-time message: {d}", .{42});
 }
