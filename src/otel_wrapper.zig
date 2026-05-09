@@ -157,6 +157,14 @@ pub const Logfire = struct {
 
             log_provider_ptr.* = otel_sdk.logs.LoggerProvider.init(allocator, log_resource);
 
+            // otel-zig defaults `default_min_severity` to .warn in non-Debug
+            // builds, which silently drops every info-level record before it
+            // reaches the exporter. logfire-zig's contract is "ship what the
+            // app emits"; let the application's `std.options.log_level` do
+            // the filtering at compile time, not the OTEL layer at runtime.
+            // matches the trace pipeline's `Sampler{ .keep = {} }` (no sampling).
+            log_provider_ptr.default_min_severity = .trace;
+
             var log_builder = log_provider_ptr.pipelineBuilder();
             log_builder = log_builder.with(
                 otel_sdk.logs.BatchLogRecordProcessor.PipelineStep.init(.{
