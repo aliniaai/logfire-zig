@@ -1,7 +1,7 @@
 //! logfire example
 //!
 //! demonstrates the otel-zig backed API.
-//! API matches current leaflet-search usage patterns.
+//! API matches current pub-search usage patterns.
 //!
 //! run with:
 //!   LOGFIRE_TOKEN=your_token zig build example
@@ -27,7 +27,7 @@ pub fn main() !void {
     logfire.info("application started", .{});
 
     // span with attributes - matches: logfire.span("name", .{attrs})
-    // uses const span pattern for API compatibility with leaflet-search
+    // uses const span pattern for API compatibility with pub-search
     {
         const span = logfire.span("example.work", .{
             .iteration = @as(i64, 1),

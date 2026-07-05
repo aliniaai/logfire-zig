@@ -12,7 +12,7 @@ look at these for patterns, don't reinvent:
 
 - `~/tangled.sh/@zzstoatzz.io/prefect-server/` - zig 0.15 http server, json handling
 - `~/tangled.sh/@zzstoatzz.io/zat/` - zig 0.15 AT Protocol client
-- `~/tangled.sh/@zzstoatzz.io/leaflet-search/` - zig backend patterns
+- `~/tangled.sh/@zzstoatzz.io/pub-search/` - zig backend patterns
 - `~/tangled.sh/@zzstoatzz.io/notes/languages/ziglang/0.15/` - zig 0.15 syntax notes
 
 ## zig 0.15 patterns
