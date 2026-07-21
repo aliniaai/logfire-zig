@@ -110,7 +110,7 @@ pub const Logfire = struct {
             errdefer allocator.destroy(provider_ptr);
 
             // create minimal resource with service name
-            const resource = try createMinimalResource(allocator, resolved.service_name orelse "logfire-zig");
+            const resource = try createMinimalResource(allocator, resolved.service_name orelse "logfire-zig", resolved.environment);
             errdefer resource.deinitOwned(allocator);
 
             provider_ptr.* = otel_sdk.trace.TracerProvider.init(
@@ -152,7 +152,7 @@ pub const Logfire = struct {
             const log_provider_ptr = try allocator.create(otel_sdk.logs.LoggerProvider);
             errdefer allocator.destroy(log_provider_ptr);
 
-            const log_resource = try createMinimalResource(allocator, resolved.service_name orelse "logfire-zig");
+            const log_resource = try createMinimalResource(allocator, resolved.service_name orelse "logfire-zig", resolved.environment);
             errdefer log_resource.deinitOwned(allocator);
 
             log_provider_ptr.* = otel_sdk.logs.LoggerProvider.init(allocator, log_resource);
@@ -554,7 +554,7 @@ fn truncateSql(buf: []u8, sql: []const u8) []const u8 {
 
 /// create a minimal resource without OS-specific detection
 /// this avoids otel-zig's ProcessDetector which only supports macOS
-fn createMinimalResource(allocator: std.mem.Allocator, service_name: []const u8) !otel_sdk.resource.Resource {
+fn createMinimalResource(allocator: std.mem.Allocator, service_name: []const u8, environment: ?[]const u8) !otel_sdk.resource.Resource {
     const builtin = @import("builtin");
 
     // build attributes
@@ -567,6 +567,11 @@ fn createMinimalResource(allocator: std.mem.Allocator, service_name: []const u8)
 
     // service name
     attrs = attrs.add(.{ .key = "service.name", .value = .{ .string = service_name } });
+
+    // deployment environment (shows up as deployment_environment in logfire)
+    if (environment) |e| {
+        attrs = attrs.add(.{ .key = "deployment.environment.name", .value = .{ .string = e } });
+    }
 
     // process.pid (works on all POSIX systems)
     const pid = std.c.getpid();
