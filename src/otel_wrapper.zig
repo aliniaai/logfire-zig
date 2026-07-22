@@ -31,12 +31,11 @@ const Config = @import("config").Config;
 var global_instance: ?*Logfire = null;
 var global_allocator: ?std.mem.Allocator = null;
 
-// ============================================================================
-// thread-local span context tracking for parent-child relationships
-// ============================================================================
-
-/// thread-local current span context - enables parent-child span linking
-threadlocal var tl_current_span_context: ?otel_api.trace.Span.Context = null;
+// Span nesting is explicit, not ambient. A thread-local "current span" is
+// unsound under an M:N coroutine runtime (e.g. zio): coroutines interleave on
+// one executor thread and migrate between threads across await points, so a
+// thread-local parent leaks across unrelated requests. Parent-child links are
+// established explicitly via `Span.child` / `Span.context` instead.
 
 // ============================================================================
 // Logfire - main SDK type
@@ -238,15 +237,27 @@ pub const Logfire = struct {
     // spans
     // ========================================================================
 
-    /// create a span with the given name and attributes
+    /// create a root span with the given name and attributes.
+    /// To nest, pass this span's `.context()` to `createSpanWithParent`, or
+    /// call `.child()` on the returned span.
     pub fn createSpan(self: *Self, name: []const u8, attrs: anytype) Span {
+        return self.createSpanWithParent(name, attrs, null);
+    }
+
+    /// create a span explicitly parented to `parent_context` (null = root).
+    /// Callers propagate the parent context themselves (e.g. through their own
+    /// per-request context), which is the only correct way to nest spans across
+    /// async/await boundaries.
+    pub fn createSpanWithParent(
+        self: *Self,
+        name: []const u8,
+        attrs: anytype,
+        parent_context: ?otel_api.trace.Span.Context,
+    ) Span {
         if (self.tracer) |*tracer| {
             const otel_attrs = attrsToOtel(attrs);
 
-            // capture parent context before creating new span
-            const parent_context = tl_current_span_context;
-
-            // build context with parent span if one exists
+            // build context with parent span if one was provided
             var ctx_storage: [1]otel_api.ContextKeyValue = undefined;
             const ctx: []const otel_api.ContextKeyValue = if (parent_context) |parent| blk: {
                 ctx_storage[0] = .{
@@ -260,15 +271,12 @@ pub const Logfire = struct {
                 .kind = .internal,
                 .attributes = otel_attrs,
             }, ctx) catch {
-                return .{ .inner = null, .parent_context = parent_context };
+                return .{ .inner = null };
             };
 
-            // update thread-local context with new span
-            tl_current_span_context = span_result.getSpanContext();
-
-            return .{ .inner = span_result, .parent_context = parent_context };
+            return .{ .inner = span_result };
         }
-        return .{ .inner = null, .parent_context = null };
+        return .{ .inner = null };
     }
 
     // ========================================================================
@@ -344,7 +352,6 @@ pub const StatusCode = enum {
 
 pub const Span = struct {
     inner: ?otel_api.trace.Span,
-    parent_context: ?otel_api.trace.Span.Context,
 
     /// end the span - takes *const for API compatibility with legacy logfire
     pub fn end(self: *const Span) void {
@@ -355,11 +362,24 @@ pub const Span = struct {
                 s.end(null);
                 s.deinit();
                 mutable.inner = null;
-
-                // restore parent context (enables proper nesting)
-                tl_current_span_context = mutable.parent_context;
             }
         }
+    }
+
+    /// this span's context, for use as the explicit parent of child spans.
+    /// Carry this through your own request/task context to nest spans across
+    /// async boundaries. Returns null for a no-op (unconfigured) span.
+    pub fn context(self: *const Span) ?otel_api.trace.Span.Context {
+        if (self.inner) |s| return s.getSpanContext();
+        return null;
+    }
+
+    /// create a child span explicitly parented to this span (uses global instance)
+    pub fn child(self: *const Span, name: []const u8, attrs: anytype) Span {
+        if (global_instance) |lf| {
+            return lf.createSpanWithParent(name, attrs, self.context());
+        }
+        return .{ .inner = null };
     }
 
     pub fn setAttribute(self: *const Span, key: []const u8, value: anytype) void {
@@ -422,7 +442,7 @@ pub fn span(name: []const u8, attrs: anytype) Span {
     if (global_instance) |lf| {
         return lf.createSpan(name, attrs);
     }
-    return .{ .inner = null, .parent_context = null };
+    return .{ .inner = null };
 }
 
 /// log at trace level
@@ -713,4 +733,23 @@ test "logFn falls back to defaultLog when bridge not initialized" {
     // gets initialized inside it). otel-zig's bridge handles this with a
     // fast-path check on its own atomic init flag.
     logFn(.info, .testing, "boot-time message: {d}", .{42});
+}
+
+test "span context/child/end are null-safe without a configured instance" {
+    // With no global instance, spans are no-ops. The explicit-nesting API must
+    // stay safe on them: a no-op span exposes no context (so it can never
+    // fabricate a parent link), child() stays a no-op, and end() is idempotent.
+    // Real parent-child linkage is covered by the token-gated integration test
+    // in tests/validate_otel_export.zig.
+    const testing = std.testing;
+
+    const root = span("root", .{});
+    try testing.expect(root.context() == null);
+
+    const kid = root.child("kid", .{});
+    try testing.expect(kid.context() == null);
+
+    kid.end();
+    root.end();
+    root.end(); // idempotent
 }

@@ -53,9 +53,10 @@ pub fn main() !void {
         const span = logfire.span("process.files", .{});
         defer span.end();
 
-        // nested spans automatically link to parent
+        // nesting is explicit: create children from their parent.
+        // (`logfire.span(...)` always starts a root span.)
         {
-            const child = logfire.span("process.single_file", .{ .filename = "data.csv" });
+            const child = span.child("process.single_file", .{ .filename = "data.csv" });
             defer child.end();
             std.time.sleep(10 * std.time.ns_per_ms);
         }
@@ -76,7 +77,7 @@ Without a token, output goes to console for local development.
 
 ## Features
 
-- **Spans** - timing and tracing with attributes, automatic parent-child linking
+- **Spans** - timing and tracing with attributes, explicit parent-child linking (`span.child()`)
 - **Instrumentation helpers** - `httpSpan()` and `sqlSpan()` for common patterns
 - **Async batched export** - BatchSpanProcessor exports every 500ms (matches Python/Rust)
 - **Logging** - trace, debug, info, warn, err (console output)
@@ -106,6 +107,17 @@ span.setAttribute("result_count", @as(i64, 42));
 
 // record errors (sets error status + adds exception event)
 span.recordError(error.ConnectionFailed);
+
+// nesting is explicit. `logfire.span(...)` / `httpSpan(...)` / `sqlSpan(...)`
+// always start ROOT spans; create children from their parent:
+const child = span.child("operation.step", .{});
+defer child.end();
+
+// to nest across function or async boundaries, carry the parent's context
+// yourself (there is no ambient "current span"):
+const parent_ctx = span.context(); // ?Span.Context — pass it down, then:
+const deep = lf.createSpanWithParent("operation.deep", .{}, parent_ctx);
+defer deep.end();
 
 // instrumentation helpers for common patterns
 const http_span = logfire.httpSpan("GET", "/api/users", .{});
@@ -152,7 +164,7 @@ zig build example    # run example
 This is an unofficial community SDK aiming for parity with [logfire-rust](https://github.com/pydantic/logfire-rust). Built on [otel-zig](https://github.com/open-telemetry/opentelemetry-zig).
 
 - [x] Spans with attributes
-- [x] Parent-child span linking (thread-local context)
+- [x] Parent-child span linking (explicit: `span.child()` / `createSpanWithParent()`)
 - [x] Error recording (`span.recordError()`)
 - [x] OTLP HTTP/protobuf export
 - [x] Async batched export (500ms interval, matches Python/Rust)
