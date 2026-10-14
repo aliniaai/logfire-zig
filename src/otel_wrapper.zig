@@ -124,8 +124,9 @@ pub const Logfire = struct {
             var builder = provider_ptr.pipelineBuilder();
             builder = builder.with(
                 otel_sdk.trace.BatchSpanProcessor.PipelineStep.init(.{
-                    .export_interval_ms = 500, // 500ms matches Python/Rust logfire
+                    .export_interval_ms = @intCast(resolved.batch_timeout_ms), // 500ms default matches Python/Rust logfire
                     .max_queue_size = 2048,
+                    .max_export_batch_size = resolved.batch_size,
                 }).flowTo(otel_exporters.otlp.OtlpTraceExporter.PipelineStep.init(otlp_config)),
             );
             try builder.done();
@@ -433,7 +434,7 @@ pub const Span = struct {
 /// configure logfire with the given options
 /// returns the configured instance
 pub fn configure(config: Config) !*Logfire {
-    const allocator = std.heap.page_allocator;
+    const allocator = config.allocator orelse std.heap.page_allocator;
     return Logfire.init(allocator, config);
 }
 

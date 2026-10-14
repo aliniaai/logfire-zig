@@ -42,9 +42,14 @@ pub const Config = struct {
     /// console output options
     console: ?ConsoleOptions = .{},
 
-    /// batch export settings
+    /// batch export settings: spans per OTLP request, and how often to flush
     batch_size: usize = 512,
     batch_timeout_ms: u64 = 500,
+
+    /// allocator for every span, attribute copy and export buffer.
+    /// null falls back to std.heap.page_allocator, which costs an mmap per
+    /// allocation; pass your gpa for anything serving real traffic.
+    allocator: ?std.mem.Allocator = null,
 
     pub const SendToLogfire = enum {
         yes,
