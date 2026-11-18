@@ -9,9 +9,8 @@
         "src",
     },
     .dependencies = .{
-        .opentelemetry = .{
-            .url = "https://github.com/zzstoatzz/otel-zig/archive/v0.1.0-alpha.2.tar.gz",
-            .hash = "otel-0.1.0-alpha.2-9q9ZWnvkFAARdTVS8Nj17Dl1LfDYrHABLrQJBIJB9ql7",
-        },
+        // harbor's fork (aliniaai/otel-zig, branch harbor: upstream's v0.1.0-alpha.2 plus
+        // harbor's fixes), beside this one
+        .opentelemetry = .{ .path = "../otel-zig" },
     },
 }
